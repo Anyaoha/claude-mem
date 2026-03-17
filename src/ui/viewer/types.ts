@@ -63,7 +63,7 @@ export interface Settings {
   // AI Provider Configuration
   CLAUDE_MEM_PROVIDER?: string;  // 'claude' | 'gemini' | 'openrouter'
   CLAUDE_MEM_GEMINI_API_KEY?: string;
-  CLAUDE_MEM_GEMINI_MODEL?: string;  // 'gemini-2.5-flash-lite' | 'gemini-2.5-flash' | 'gemini-3-flash'
+  CLAUDE_MEM_GEMINI_MODEL?: string;  // 'gemini-2.5-flash-lite' | 'gemini-2.5-flash' | 'gemini-3-flash-preview'
   CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED?: string;  // 'true' | 'false'
   CLAUDE_MEM_OPENROUTER_API_KEY?: string;
   CLAUDE_MEM_OPENROUTER_MODEL?: string;
@@ -75,10 +75,6 @@ export interface Settings {
   CLAUDE_MEM_CONTEXT_SHOW_WORK_TOKENS?: string;
   CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_AMOUNT?: string;
   CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_PERCENT?: string;
-
-  // Observation Filtering
-  CLAUDE_MEM_CONTEXT_OBSERVATION_TYPES?: string;
-  CLAUDE_MEM_CONTEXT_OBSERVATION_CONCEPTS?: string;
 
   // Display Configuration
   CLAUDE_MEM_CONTEXT_FULL_COUNT?: string;

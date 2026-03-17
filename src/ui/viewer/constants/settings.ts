@@ -24,10 +24,6 @@ export const DEFAULT_SETTINGS = {
   CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_AMOUNT: 'true',
   CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_PERCENT: 'true',
 
-  // Observation Filtering (all types and concepts)
-  CLAUDE_MEM_CONTEXT_OBSERVATION_TYPES: 'bugfix,feature,refactor,discovery,decision,change',
-  CLAUDE_MEM_CONTEXT_OBSERVATION_CONCEPTS: 'how-it-works,why-it-exists,what-changed,problem-solution,gotcha,pattern,trade-off',
-
   // Display Configuration
   CLAUDE_MEM_CONTEXT_FULL_COUNT: '5',
   CLAUDE_MEM_CONTEXT_FULL_FIELD: 'narrative',
@@ -36,4 +32,8 @@ export const DEFAULT_SETTINGS = {
   // Feature Toggles
   CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY: 'true',
   CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE: 'false',
+
+  // Exclusion Settings
+  CLAUDE_MEM_EXCLUDED_PROJECTS: '',
+  CLAUDE_MEM_FOLDER_MD_EXCLUDE: '[]',
 } as const;

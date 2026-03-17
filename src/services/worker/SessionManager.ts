@@ -15,6 +15,7 @@ import type { ActiveSession, PendingMessage, PendingMessageWithId, ObservationDa
 import { PendingMessageStore } from '../sqlite/PendingMessageStore.js';
 import { SessionQueueProcessor } from '../queue/SessionQueueProcessor.js';
 import { getProcessBySession, ensureProcessExit } from './ProcessRegistry.js';
+import { getSupervisor } from '../../supervisor/index.js';
 
 export class SessionManager {
   private dbManager: DatabaseManager;
@@ -153,7 +154,10 @@ export class SessionManager {
       cumulativeOutputTokens: 0,
       earliestPendingTimestamp: null,
       conversationHistory: [],  // Initialize empty - will be populated by agents
-      currentProvider: null  // Will be set when generator starts
+      currentProvider: null,  // Will be set when generator starts
+      consecutiveRestarts: 0,  // Track consecutive restart attempts to prevent infinite loops
+      processingMessageIds: [],  // CLAIM-CONFIRM: Track message IDs for confirmProcessed()
+      lastGeneratorActivity: Date.now()  // Initialize for stale detection (Issue #1099)
     };
 
     logger.debug('SESSION', 'Creating new session object (memorySessionId cleared to prevent stale resume)', {
@@ -284,21 +288,38 @@ export class SessionManager {
     // 1. Abort the SDK agent
     session.abortController.abort();
 
-    // 2. Wait for generator to finish
+    // 2. Wait for generator to finish (with 30s timeout to prevent stale stall, Issue #1099)
     if (session.generatorPromise) {
-      await session.generatorPromise.catch(() => {
+      const generatorDone = session.generatorPromise.catch(() => {
         logger.debug('SYSTEM', 'Generator already failed, cleaning up', { sessionId: session.sessionDbId });
+      });
+      const timeoutDone = new Promise<void>(resolve => {
+        AbortSignal.timeout(30_000).addEventListener('abort', () => resolve(), { once: true });
+      });
+      await Promise.race([generatorDone, timeoutDone]).then(() => {}, () => {
+        logger.warn('SESSION', 'Generator did not exit within 30s after abort, forcing cleanup (#1099)', { sessionDbId });
       });
     }
 
     // 3. Verify subprocess exit with 5s timeout (Issue #737 fix)
     const tracked = getProcessBySession(sessionDbId);
-    if (tracked && !tracked.process.killed && tracked.process.exitCode === null) {
+    if (tracked && tracked.process.exitCode === null) {
       logger.debug('SESSION', `Waiting for subprocess PID ${tracked.pid} to exit`, {
         sessionId: sessionDbId,
         pid: tracked.pid
       });
       await ensureProcessExit(tracked, 5000);
+    }
+
+    // 3b. Reap all supervisor-tracked processes for this session (#1351)
+    // This catches MCP servers and other child processes not tracked by the
+    // in-memory ProcessRegistry (e.g. processes registered only in supervisor.json).
+    try {
+      await getSupervisor().getRegistry().reapSession(sessionDbId);
+    } catch (error) {
+      logger.warn('SESSION', 'Supervisor reapSession failed (non-blocking)', {
+        sessionId: sessionDbId
+      }, error as Error);
     }
 
     // 4. Cleanup
@@ -315,6 +336,61 @@ export class SessionManager {
     if (this.onSessionDeletedCallback) {
       this.onSessionDeletedCallback();
     }
+  }
+
+  /**
+   * Remove session from in-memory maps and notify without awaiting generator.
+   * Used when SDK resume fails and we give up (no fallback): avoids deadlock
+   * from deleteSession() awaiting the same generator promise we're inside.
+   */
+  removeSessionImmediate(sessionDbId: number): void {
+    const session = this.sessions.get(sessionDbId);
+    if (!session) return;
+
+    this.sessions.delete(sessionDbId);
+    this.sessionQueues.delete(sessionDbId);
+
+    logger.info('SESSION', 'Session removed (orphaned after SDK termination)', {
+      sessionId: sessionDbId,
+      project: session.project
+    });
+
+    if (this.onSessionDeletedCallback) {
+      this.onSessionDeletedCallback();
+    }
+  }
+
+  private static readonly MAX_SESSION_IDLE_MS = 15 * 60 * 1000; // 15 minutes
+
+  /**
+   * Reap sessions with no active generator and no pending work that have been idle too long.
+   * This unblocks the orphan reaper which skips processes for "active" sessions. (Issue #1168)
+   */
+  async reapStaleSessions(): Promise<number> {
+    const now = Date.now();
+    const staleSessionIds: number[] = [];
+
+    for (const [sessionDbId, session] of this.sessions) {
+      // Skip sessions with active generators
+      if (session.generatorPromise) continue;
+
+      // Skip sessions with pending work
+      const pendingCount = this.getPendingStore().getPendingCount(sessionDbId);
+      if (pendingCount > 0) continue;
+
+      // No generator + no pending work + old enough = stale
+      const sessionAge = now - session.startTime;
+      if (sessionAge > SessionManager.MAX_SESSION_IDLE_MS) {
+        staleSessionIds.push(sessionDbId);
+      }
+    }
+
+    for (const sessionDbId of staleSessionIds) {
+      logger.warn('SESSION', `Reaping stale session ${sessionDbId} (no activity for >${Math.round(SessionManager.MAX_SESSION_IDLE_MS / 60000)}m)`, { sessionDbId });
+      await this.deleteSession(sessionDbId);
+    }
+
+    return staleSessionIds.length;
   }
 
   /**
@@ -392,7 +468,17 @@ export class SessionManager {
     const processor = new SessionQueueProcessor(this.getPendingStore(), emitter);
 
     // Use the robust iterator - messages are deleted on claim (no tracking needed)
-    for await (const message of processor.createIterator(sessionDbId, session.abortController.signal)) {
+    // CRITICAL: Pass onIdleTimeout callback that triggers abort to kill the subprocess
+    // Without this, the iterator returns but the Claude subprocess stays alive as a zombie
+    for await (const message of processor.createIterator({
+      sessionDbId,
+      signal: session.abortController.signal,
+      onIdleTimeout: () => {
+        logger.info('SESSION', 'Triggering abort due to idle timeout to kill subprocess', { sessionDbId });
+        session.idleTimedOut = true;
+        session.abortController.abort();
+      }
+    })) {
       // Track earliest timestamp for accurate observation timestamps
       // This ensures backlog messages get their original timestamps, not current time
       if (session.earliestPendingTimestamp === null) {
@@ -400,6 +486,9 @@ export class SessionManager {
       } else {
         session.earliestPendingTimestamp = Math.min(session.earliestPendingTimestamp, message._originalTimestamp);
       }
+
+      // Update generator activity for stale detection (Issue #1099)
+      session.lastGeneratorActivity = Date.now();
 
       yield message;
     }

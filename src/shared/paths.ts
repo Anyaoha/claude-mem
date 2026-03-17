@@ -24,9 +24,42 @@ const _dirname = getDirname();
  */
 
 // Base directories
-export const DATA_DIR = SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR');
+// Resolve DATA_DIR with full priority: env var > settings.json > default.
+// SettingsDefaultsManager.get() handles env > default. For settings file
+// support, we do a one-time synchronous read of the default settings path
+// to check if the user configured a custom DATA_DIR there.
+function resolveDataDir(): string {
+  // 1. Environment variable (highest priority) — already handled by get()
+  if (process.env.CLAUDE_MEM_DATA_DIR) {
+    return process.env.CLAUDE_MEM_DATA_DIR;
+  }
+
+  // 2. Settings file at the default location
+  const defaultDataDir = join(homedir(), '.claude-mem');
+  const settingsPath = join(defaultDataDir, 'settings.json');
+  try {
+    if (existsSync(settingsPath)) {
+      const { readFileSync } = require('fs');
+      const raw = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      const settings = raw.env ?? raw; // handle legacy nested schema
+      if (settings.CLAUDE_MEM_DATA_DIR) {
+        return settings.CLAUDE_MEM_DATA_DIR;
+      }
+    }
+  } catch {
+    // settings file missing or corrupt — fall through to default
+  }
+
+  // 3. Hardcoded default
+  return defaultDataDir;
+}
+
+export const DATA_DIR = resolveDataDir();
 // Note: CLAUDE_CONFIG_DIR is a Claude Code setting, not claude-mem, so leave as env var
 export const CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
+
+// Plugin installation directory - respects CLAUDE_CONFIG_DIR for users with custom Claude locations
+export const MARKETPLACE_ROOT = join(CLAUDE_CONFIG_DIR, 'plugins', 'marketplaces', 'thedotmack');
 
 // Data subdirectories
 export const ARCHIVES_DIR = join(DATA_DIR, 'archives');
@@ -96,7 +129,9 @@ export function ensureAllClaudeDirs(): void {
 }
 
 /**
- * Get current project name from git root or cwd
+ * Get current project name from git root or cwd.
+ * Includes parent directory to avoid collisions when repos share a folder name
+ * (e.g., ~/work/monorepo → "work/monorepo" vs ~/personal/monorepo → "personal/monorepo").
  */
 export function getCurrentProjectName(): string {
   try {
@@ -106,12 +141,13 @@ export function getCurrentProjectName(): string {
       stdio: ['pipe', 'pipe', 'ignore'],
       windowsHide: true
     }).trim();
-    return basename(gitRoot);
+    return basename(dirname(gitRoot)) + '/' + basename(gitRoot);
   } catch (error) {
     logger.debug('SYSTEM', 'Git root detection failed, using cwd basename', {
       cwd: process.cwd()
     }, error as Error);
-    return basename(process.cwd());
+    const cwd = process.cwd();
+    return basename(dirname(cwd)) + '/' + basename(cwd);
   }
 }
 

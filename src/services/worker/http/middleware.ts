@@ -24,8 +24,23 @@ export function createMiddleware(
   // JSON parsing with 50mb limit
   middlewares.push(express.json({ limit: '50mb' }));
 
-  // CORS
-  middlewares.push(cors());
+  // CORS - restrict to localhost origins only
+  middlewares.push(cors({
+    origin: (origin, callback) => {
+      // Allow: requests without Origin header (hooks, curl, CLI tools)
+      // Allow: localhost and 127.0.0.1 origins
+      if (!origin ||
+          origin.startsWith('http://localhost:') ||
+          origin.startsWith('http://127.0.0.1:')) {
+        callback(null, true);
+      } else {
+        callback(new Error('CORS not allowed'));
+      }
+    },
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+    credentials: false
+  }));
 
   // HTTP request/response logging
   middlewares.push((req: Request, res: Response, next: NextFunction) => {
@@ -42,13 +57,13 @@ export function createMiddleware(
 
     // Log incoming request with body summary
     const bodySummary = summarizeRequestBody(req.method, req.path, req.body);
-    logger.info('HTTP', `→ ${req.method} ${req.path}`, { requestId }, bodySummary);
+    logger.debug('HTTP', `→ ${req.method} ${req.path}`, { requestId }, bodySummary);
 
     // Capture response
     const originalSend = res.send.bind(res);
     res.send = function(body: any) {
       const duration = Date.now() - start;
-      logger.info('HTTP', `← ${res.statusCode} ${req.path}`, { requestId, duration: `${duration}ms` });
+      logger.debug('HTTP', `← ${res.statusCode} ${req.path}`, { requestId, duration: `${duration}ms` });
       return originalSend(body);
     };
 

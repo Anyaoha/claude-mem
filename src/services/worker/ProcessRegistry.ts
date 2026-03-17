@@ -19,6 +19,8 @@
 import { spawn, exec, ChildProcess } from 'child_process';
 import { promisify } from 'util';
 import { logger } from '../../utils/logger.js';
+import { sanitizeEnv } from '../../supervisor/env-sanitizer.js';
+import { getSupervisor } from '../../supervisor/index.js';
 
 const execAsync = promisify(exec);
 
@@ -29,23 +31,51 @@ interface TrackedProcess {
   process: ChildProcess;
 }
 
-// PID Registry - tracks spawned Claude subprocesses
-const processRegistry = new Map<number, TrackedProcess>();
+function getTrackedProcesses(): TrackedProcess[] {
+  return getSupervisor().getRegistry()
+    .getAll()
+    .filter(record => record.type === 'sdk')
+    .map((record) => {
+      const processRef = getSupervisor().getRegistry().getRuntimeProcess(record.id);
+      if (!processRef) {
+        return null;
+      }
+
+      return {
+        pid: record.pid,
+        sessionDbId: Number(record.sessionId),
+        spawnedAt: Date.parse(record.startedAt),
+        process: processRef
+      };
+    })
+    .filter((value): value is TrackedProcess => value !== null);
+}
 
 /**
  * Register a spawned process in the registry
  */
 export function registerProcess(pid: number, sessionDbId: number, process: ChildProcess): void {
-  processRegistry.set(pid, { pid, sessionDbId, spawnedAt: Date.now(), process });
+  getSupervisor().registerProcess(`sdk:${sessionDbId}:${pid}`, {
+    pid,
+    type: 'sdk',
+    sessionId: sessionDbId,
+    startedAt: new Date().toISOString()
+  }, process);
   logger.info('PROCESS', `Registered PID ${pid} for session ${sessionDbId}`, { pid, sessionDbId });
 }
 
 /**
- * Unregister a process from the registry
+ * Unregister a process from the registry and notify pool waiters
  */
 export function unregisterProcess(pid: number): void {
-  processRegistry.delete(pid);
+  for (const record of getSupervisor().getRegistry().getByPid(pid)) {
+    if (record.type === 'sdk') {
+      getSupervisor().unregisterProcess(record.id);
+    }
+  }
   logger.debug('PROCESS', `Unregistered PID ${pid}`, { pid });
+  // Notify waiters that a pool slot may be available
+  notifySlotAvailable();
 }
 
 /**
@@ -53,10 +83,7 @@ export function unregisterProcess(pid: number): void {
  * Warns if multiple processes found (indicates race condition)
  */
 export function getProcessBySession(sessionDbId: number): TrackedProcess | undefined {
-  const matches: TrackedProcess[] = [];
-  for (const [, info] of processRegistry) {
-    if (info.sessionDbId === sessionDbId) matches.push(info);
-  }
+  const matches = getTrackedProcesses().filter(info => info.sessionDbId === sessionDbId);
   if (matches.length > 1) {
     logger.warn('PROCESS', `Multiple processes found for session ${sessionDbId}`, {
       count: matches.length,
@@ -67,11 +94,68 @@ export function getProcessBySession(sessionDbId: number): TrackedProcess | undef
 }
 
 /**
+ * Get count of active processes in the registry
+ */
+export function getActiveCount(): number {
+  return getSupervisor().getRegistry().getAll().filter(record => record.type === 'sdk').length;
+}
+
+// Waiters for pool slots - resolved when a process exits and frees a slot
+const slotWaiters: Array<() => void> = [];
+
+/**
+ * Notify waiters that a slot has freed up
+ */
+function notifySlotAvailable(): void {
+  const waiter = slotWaiters.shift();
+  if (waiter) waiter();
+}
+
+/**
+ * Wait for a pool slot to become available (promise-based, not polling)
+ * @param maxConcurrent Max number of concurrent agents
+ * @param timeoutMs Max time to wait before giving up
+ */
+const TOTAL_PROCESS_HARD_CAP = 10;
+
+export async function waitForSlot(maxConcurrent: number, timeoutMs: number = 60_000): Promise<void> {
+  // Hard cap: refuse to spawn if too many processes exist regardless of pool accounting
+  const activeCount = getActiveCount();
+  if (activeCount >= TOTAL_PROCESS_HARD_CAP) {
+    throw new Error(`Hard cap exceeded: ${activeCount} processes in registry (cap=${TOTAL_PROCESS_HARD_CAP}). Refusing to spawn more.`);
+  }
+
+  if (activeCount < maxConcurrent) return;
+
+  logger.info('PROCESS', `Pool limit reached (${activeCount}/${maxConcurrent}), waiting for slot...`);
+
+  return new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      const idx = slotWaiters.indexOf(onSlot);
+      if (idx >= 0) slotWaiters.splice(idx, 1);
+      reject(new Error(`Timed out waiting for agent pool slot after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    const onSlot = () => {
+      clearTimeout(timeout);
+      if (getActiveCount() < maxConcurrent) {
+        resolve();
+      } else {
+        // Still full, re-queue
+        slotWaiters.push(onSlot);
+      }
+    };
+
+    slotWaiters.push(onSlot);
+  });
+}
+
+/**
  * Get all active PIDs (for debugging)
  */
 export function getActiveProcesses(): Array<{ pid: number; sessionDbId: number; ageMs: number }> {
   const now = Date.now();
-  return Array.from(processRegistry.values()).map(info => ({
+  return getTrackedProcesses().map(info => ({
     pid: info.pid,
     sessionDbId: info.sessionDbId,
     ageMs: now - info.spawnedAt
@@ -85,8 +169,9 @@ export function getActiveProcesses(): Array<{ pid: number; sessionDbId: number; 
 export async function ensureProcessExit(tracked: TrackedProcess, timeoutMs: number = 5000): Promise<void> {
   const { pid, process: proc } = tracked;
 
-  // Already exited?
-  if (proc.killed || proc.exitCode !== null) {
+  // Already exited? Only trust exitCode, NOT proc.killed
+  // proc.killed only means Node sent a signal — the process can still be alive
+  if (proc.exitCode !== null) {
     unregisterProcess(pid);
     return;
   }
@@ -102,8 +187,8 @@ export async function ensureProcessExit(tracked: TrackedProcess, timeoutMs: numb
 
   await Promise.race([exitPromise, timeoutPromise]);
 
-  // Check if exited gracefully
-  if (proc.killed || proc.exitCode !== null) {
+  // Check if exited gracefully — only trust exitCode
+  if (proc.exitCode !== null) {
     unregisterProcess(pid);
     return;
   }
@@ -116,9 +201,95 @@ export async function ensureProcessExit(tracked: TrackedProcess, timeoutMs: numb
     // Already dead
   }
 
-  // Brief wait for SIGKILL to take effect
-  await new Promise(resolve => setTimeout(resolve, 200));
+  // Wait for SIGKILL to take effect — use exit event with 1s timeout instead of blind sleep
+  const sigkillExitPromise = new Promise<void>((resolve) => {
+    proc.once('exit', () => resolve());
+  });
+  const sigkillTimeout = new Promise<void>((resolve) => {
+    setTimeout(resolve, 1000);
+  });
+  await Promise.race([sigkillExitPromise, sigkillTimeout]);
   unregisterProcess(pid);
+}
+
+/**
+ * Kill idle daemon children (claude processes spawned by worker-service)
+ *
+ * These are SDK-spawned claude processes that completed their work but
+ * didn't terminate properly. They remain as children of the worker-service
+ * daemon, consuming memory without doing useful work.
+ *
+ * Criteria for cleanup:
+ * - Process name is "claude"
+ * - Parent PID is the worker-service daemon (this process)
+ * - Process has 0% CPU (idle)
+ * - Process has been running for more than 2 minutes
+ */
+async function killIdleDaemonChildren(): Promise<number> {
+  if (process.platform === 'win32') {
+    // Windows: Different process model, skip for now
+    return 0;
+  }
+
+  const daemonPid = process.pid;
+  let killed = 0;
+
+  try {
+    const { stdout } = await execAsync(
+      'ps -eo pid,ppid,%cpu,etime,comm 2>/dev/null | grep "claude$" || true'
+    );
+
+    for (const line of stdout.trim().split('\n')) {
+      if (!line) continue;
+
+      const parts = line.trim().split(/\s+/);
+      if (parts.length < 5) continue;
+
+      const [pidStr, ppidStr, cpuStr, etime] = parts;
+      const pid = parseInt(pidStr, 10);
+      const ppid = parseInt(ppidStr, 10);
+      const cpu = parseFloat(cpuStr);
+
+      // Skip if not a child of this daemon
+      if (ppid !== daemonPid) continue;
+
+      // Skip if actively using CPU
+      if (cpu > 0) continue;
+
+      // Parse elapsed time to minutes
+      // Formats: MM:SS, HH:MM:SS, D-HH:MM:SS
+      let minutes = 0;
+      const dayMatch = etime.match(/^(\d+)-(\d+):(\d+):(\d+)$/);
+      const hourMatch = etime.match(/^(\d+):(\d+):(\d+)$/);
+      const minMatch = etime.match(/^(\d+):(\d+)$/);
+
+      if (dayMatch) {
+        minutes = parseInt(dayMatch[1], 10) * 24 * 60 +
+                  parseInt(dayMatch[2], 10) * 60 +
+                  parseInt(dayMatch[3], 10);
+      } else if (hourMatch) {
+        minutes = parseInt(hourMatch[1], 10) * 60 +
+                  parseInt(hourMatch[2], 10);
+      } else if (minMatch) {
+        minutes = parseInt(minMatch[1], 10);
+      }
+
+      // Kill if idle for more than 1 minute
+      if (minutes >= 1) {
+        logger.info('PROCESS', `Killing idle daemon child PID ${pid} (idle ${minutes}m)`, { pid, minutes });
+        try {
+          process.kill(pid, 'SIGKILL');
+          killed++;
+        } catch {
+          // Already dead or permission denied
+        }
+      }
+    }
+  } catch {
+    // No matches or command error
+  }
+
+  return killed;
 }
 
 /**
@@ -163,21 +334,33 @@ export async function reapOrphanedProcesses(activeSessionIds: Set<number>): Prom
   let killed = 0;
 
   // Registry-based: kill processes for dead sessions
-  for (const [pid, info] of processRegistry) {
-    if (activeSessionIds.has(info.sessionDbId)) continue; // Active = safe
+  for (const record of getSupervisor().getRegistry().getAll().filter(entry => entry.type === 'sdk')) {
+    const pid = record.pid;
+    const sessionDbId = Number(record.sessionId);
+    const processRef = getSupervisor().getRegistry().getRuntimeProcess(record.id);
 
-    logger.warn('PROCESS', `Killing orphan PID ${pid} (session ${info.sessionDbId} gone)`, { pid, sessionDbId: info.sessionDbId });
+    if (activeSessionIds.has(sessionDbId)) continue; // Active = safe
+
+    logger.warn('PROCESS', `Killing orphan PID ${pid} (session ${sessionDbId} gone)`, { pid, sessionDbId });
     try {
-      info.process.kill('SIGKILL');
+      if (processRef) {
+        processRef.kill('SIGKILL');
+      } else {
+        process.kill(pid, 'SIGKILL');
+      }
       killed++;
     } catch {
       // Already dead
     }
-    unregisterProcess(pid);
+    getSupervisor().unregisterProcess(record.id);
+    notifySlotAvailable();
   }
 
   // System-level: find ppid=1 orphans
   killed += await killSystemOrphans();
+
+  // Daemon children: find idle SDK processes that didn't terminate
+  killed += await killIdleDaemonChildren();
 
   return killed;
 }
@@ -199,20 +382,44 @@ export function createPidCapturingSpawn(sessionDbId: number) {
     env?: NodeJS.ProcessEnv;
     signal?: AbortSignal;
   }) => {
-    const child = spawn(spawnOptions.command, spawnOptions.args, {
-      cwd: spawnOptions.cwd,
-      env: spawnOptions.env,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      signal: spawnOptions.signal, // CRITICAL: Pass signal for AbortController integration
-      windowsHide: true
-    });
+    getSupervisor().assertCanSpawn('claude sdk');
+
+    // On Windows, use cmd.exe wrapper for .cmd files to properly handle paths with spaces
+    const useCmdWrapper = process.platform === 'win32' && spawnOptions.command.endsWith('.cmd');
+    const env = sanitizeEnv(spawnOptions.env ?? process.env);
+
+    const child = useCmdWrapper
+      ? spawn('cmd.exe', ['/d', '/c', spawnOptions.command, ...spawnOptions.args], {
+          cwd: spawnOptions.cwd,
+          env,
+          stdio: ['pipe', 'pipe', 'pipe'],
+          signal: spawnOptions.signal,
+          windowsHide: true
+        })
+      : spawn(spawnOptions.command, spawnOptions.args, {
+          cwd: spawnOptions.cwd,
+          env,
+          stdio: ['pipe', 'pipe', 'pipe'],
+          signal: spawnOptions.signal, // CRITICAL: Pass signal for AbortController integration
+          windowsHide: true
+        });
+
+    // Capture stderr for debugging spawn failures
+    if (child.stderr) {
+      child.stderr.on('data', (data: Buffer) => {
+        logger.debug('SDK_SPAWN', `[session-${sessionDbId}] stderr: ${data.toString().trim()}`);
+      });
+    }
 
     // Register PID
     if (child.pid) {
       registerProcess(child.pid, sessionDbId, child);
 
       // Auto-unregister on exit
-      child.on('exit', () => {
+      child.on('exit', (code: number | null, signal: string | null) => {
+        if (code !== 0) {
+          logger.warn('SDK_SPAWN', `[session-${sessionDbId}] Claude process exited`, { code, signal, pid: child.pid });
+        }
         if (child.pid) {
           unregisterProcess(child.pid);
         }
@@ -223,6 +430,7 @@ export function createPidCapturingSpawn(sessionDbId: number) {
     return {
       stdin: child.stdin,
       stdout: child.stdout,
+      stderr: child.stderr,
       get killed() { return child.killed; },
       get exitCode() { return child.exitCode; },
       kill: child.kill.bind(child),
@@ -237,7 +445,7 @@ export function createPidCapturingSpawn(sessionDbId: number) {
  * Start the orphan reaper interval
  * Returns cleanup function to stop the interval
  */
-export function startOrphanReaper(getActiveSessionIds: () => Set<number>, intervalMs: number = 5 * 60 * 1000): () => void {
+export function startOrphanReaper(getActiveSessionIds: () => Set<number>, intervalMs: number = 30 * 1000): () => void {
   const interval = setInterval(async () => {
     try {
       const activeIds = getActiveSessionIds();

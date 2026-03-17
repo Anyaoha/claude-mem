@@ -8,7 +8,6 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
-import { DEFAULT_OBSERVATION_TYPES_STRING, DEFAULT_OBSERVATION_CONCEPTS_STRING } from '../constants/observation-metadata.js';
 // NOTE: Do NOT import logger here - it creates a circular dependency
 // logger.ts depends on SettingsDefaultsManager for its initialization
 
@@ -20,8 +19,9 @@ export interface SettingsDefaults {
   CLAUDE_MEM_SKIP_TOOLS: string;
   // AI Provider Configuration
   CLAUDE_MEM_PROVIDER: string;  // 'claude' | 'gemini' | 'openrouter'
+  CLAUDE_MEM_CLAUDE_AUTH_METHOD: string;  // 'cli' | 'api' - how Claude provider authenticates
   CLAUDE_MEM_GEMINI_API_KEY: string;
-  CLAUDE_MEM_GEMINI_MODEL: string;  // 'gemini-2.5-flash-lite' | 'gemini-2.5-flash' | 'gemini-3-flash'
+  CLAUDE_MEM_GEMINI_MODEL: string;  // 'gemini-2.5-flash-lite' | 'gemini-2.5-flash' | 'gemini-3-flash-preview'
   CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED: string;  // 'true' | 'false' - enable rate limiting for free tier
   CLAUDE_MEM_OPENROUTER_API_KEY: string;
   CLAUDE_MEM_OPENROUTER_MODEL: string;
@@ -40,9 +40,6 @@ export interface SettingsDefaults {
   CLAUDE_MEM_CONTEXT_SHOW_WORK_TOKENS: string;
   CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_AMOUNT: string;
   CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_PERCENT: string;
-  // Observation Filtering
-  CLAUDE_MEM_CONTEXT_OBSERVATION_TYPES: string;
-  CLAUDE_MEM_CONTEXT_OBSERVATION_CONCEPTS: string;
   // Display Configuration
   CLAUDE_MEM_CONTEXT_FULL_COUNT: string;
   CLAUDE_MEM_CONTEXT_FULL_FIELD: string;
@@ -50,6 +47,23 @@ export interface SettingsDefaults {
   // Feature Toggles
   CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY: string;
   CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE: string;
+  CLAUDE_MEM_CONTEXT_SHOW_TERMINAL_OUTPUT: string;
+  CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED: string;
+  // Process Management
+  CLAUDE_MEM_MAX_CONCURRENT_AGENTS: string;  // Max concurrent Claude SDK agent subprocesses (default: 2)
+  // Exclusion Settings
+  CLAUDE_MEM_EXCLUDED_PROJECTS: string;  // Comma-separated glob patterns for excluded project paths
+  CLAUDE_MEM_FOLDER_MD_EXCLUDE: string;  // JSON array of folder paths to exclude from CLAUDE.md generation
+  // Chroma Vector Database Configuration
+  CLAUDE_MEM_CHROMA_ENABLED: string;   // 'true' | 'false' - set to 'false' for SQLite-only mode
+  CLAUDE_MEM_CHROMA_MODE: string;      // 'local' | 'remote'
+  CLAUDE_MEM_CHROMA_HOST: string;
+  CLAUDE_MEM_CHROMA_PORT: string;
+  CLAUDE_MEM_CHROMA_SSL: string;
+  // Future cloud support
+  CLAUDE_MEM_CHROMA_API_KEY: string;
+  CLAUDE_MEM_CHROMA_TENANT: string;
+  CLAUDE_MEM_CHROMA_DATABASE: string;
 }
 
 export class SettingsDefaultsManager {
@@ -64,6 +78,7 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_SKIP_TOOLS: 'ListMcpResourcesTool,SlashCommand,Skill,TodoWrite,AskUserQuestion',
     // AI Provider Configuration
     CLAUDE_MEM_PROVIDER: 'claude',  // Default to Claude
+    CLAUDE_MEM_CLAUDE_AUTH_METHOD: 'cli',  // Default to CLI subscription billing (not API key)
     CLAUDE_MEM_GEMINI_API_KEY: '',  // Empty by default, can be set via UI or env
     CLAUDE_MEM_GEMINI_MODEL: 'gemini-2.5-flash-lite',  // Default Gemini model (highest free tier RPM)
     CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED: 'true',  // Rate limiting ON by default for free tier users
@@ -80,20 +95,34 @@ export class SettingsDefaultsManager {
     CLAUDE_CODE_PATH: '', // Empty means auto-detect via 'which claude'
     CLAUDE_MEM_MODE: 'code', // Default mode profile
     // Token Economics
-    CLAUDE_MEM_CONTEXT_SHOW_READ_TOKENS: 'true',
-    CLAUDE_MEM_CONTEXT_SHOW_WORK_TOKENS: 'true',
-    CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_AMOUNT: 'true',
+    CLAUDE_MEM_CONTEXT_SHOW_READ_TOKENS: 'false',
+    CLAUDE_MEM_CONTEXT_SHOW_WORK_TOKENS: 'false',
+    CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_AMOUNT: 'false',
     CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_PERCENT: 'true',
-    // Observation Filtering
-    CLAUDE_MEM_CONTEXT_OBSERVATION_TYPES: DEFAULT_OBSERVATION_TYPES_STRING,
-    CLAUDE_MEM_CONTEXT_OBSERVATION_CONCEPTS: DEFAULT_OBSERVATION_CONCEPTS_STRING,
     // Display Configuration
-    CLAUDE_MEM_CONTEXT_FULL_COUNT: '5',
+    CLAUDE_MEM_CONTEXT_FULL_COUNT: '0',
     CLAUDE_MEM_CONTEXT_FULL_FIELD: 'narrative',
     CLAUDE_MEM_CONTEXT_SESSION_COUNT: '10',
     // Feature Toggles
     CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY: 'true',
     CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE: 'false',
+    CLAUDE_MEM_CONTEXT_SHOW_TERMINAL_OUTPUT: 'true',
+    CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED: 'false',
+    // Process Management
+    CLAUDE_MEM_MAX_CONCURRENT_AGENTS: '2',  // Max concurrent Claude SDK agent subprocesses
+    // Exclusion Settings
+    CLAUDE_MEM_EXCLUDED_PROJECTS: '',  // Comma-separated glob patterns for excluded project paths
+    CLAUDE_MEM_FOLDER_MD_EXCLUDE: '[]',  // JSON array of folder paths to exclude from CLAUDE.md generation
+    // Chroma Vector Database Configuration
+    CLAUDE_MEM_CHROMA_ENABLED: 'true',         // Set to 'false' to disable Chroma and use SQLite-only search
+    CLAUDE_MEM_CHROMA_MODE: 'local',           // 'local' uses persistent chroma-mcp via uvx, 'remote' connects to existing server
+    CLAUDE_MEM_CHROMA_HOST: '127.0.0.1',
+    CLAUDE_MEM_CHROMA_PORT: '8000',
+    CLAUDE_MEM_CHROMA_SSL: 'false',
+    // Future cloud support (claude-mem pro)
+    CLAUDE_MEM_CHROMA_API_KEY: '',
+    CLAUDE_MEM_CHROMA_TENANT: 'default_tenant',
+    CLAUDE_MEM_CHROMA_DATABASE: 'default_database',
   };
 
   /**
@@ -104,10 +133,15 @@ export class SettingsDefaultsManager {
   }
 
   /**
-   * Get a default value from defaults (no environment variable override)
+   * Get a setting value with environment variable override.
+   * Priority: process.env > hardcoded default
+   *
+   * For full priority (env > settings file > default), use loadFromFile().
+   * This method is safe to call at module-load time (no file I/O) and still
+   * respects environment variable overrides that were previously ignored.
    */
   static get(key: keyof SettingsDefaults): string {
-    return this.DEFAULTS[key];
+    return process.env[key] ?? this.DEFAULTS[key];
   }
 
   /**
@@ -120,16 +154,36 @@ export class SettingsDefaultsManager {
 
   /**
    * Get a boolean default value
+   * Handles both string 'true' and boolean true from JSON
    */
   static getBool(key: keyof SettingsDefaults): boolean {
     const value = this.get(key);
-    return value === 'true';
+    return value === 'true' || value === true;
+  }
+
+  /**
+   * Apply environment variable overrides to settings
+   * Environment variables take highest priority over file and defaults
+   */
+  private static applyEnvOverrides(settings: SettingsDefaults): SettingsDefaults {
+    const result = { ...settings };
+    for (const key of Object.keys(this.DEFAULTS) as Array<keyof SettingsDefaults>) {
+      if (process.env[key] !== undefined) {
+        result[key] = process.env[key]!;
+      }
+    }
+    return result;
   }
 
   /**
    * Load settings from file with fallback to defaults
-   * Returns merged settings with defaults as fallback
-   * Handles all errors (missing file, corrupted JSON, permissions) by returning defaults
+   * Returns merged settings with proper priority: process.env > settings file > defaults
+   * Handles all errors (missing file, corrupted JSON, permissions) gracefully
+   *
+   * Configuration Priority:
+   *   1. Environment variables (highest priority)
+   *   2. Settings file (~/.claude-mem/settings.json)
+   *   3. Default values (lowest priority)
    */
   static loadFromFile(settingsPath: string): SettingsDefaults {
     try {
@@ -146,7 +200,8 @@ export class SettingsDefaultsManager {
         } catch (error) {
           console.warn('[SETTINGS] Failed to create settings file, using in-memory defaults:', settingsPath, error);
         }
-        return defaults;
+        // Still apply env var overrides even when file doesn't exist
+        return this.applyEnvOverrides(defaults);
       }
 
       const settingsData = readFileSync(settingsPath, 'utf-8');
@@ -176,10 +231,12 @@ export class SettingsDefaultsManager {
         }
       }
 
-      return result;
+      // Apply environment variable overrides (highest priority)
+      return this.applyEnvOverrides(result);
     } catch (error) {
       console.warn('[SETTINGS] Failed to load settings, using defaults:', settingsPath, error);
-      return this.getAllDefaults();
+      // Still apply env var overrides even on error
+      return this.applyEnvOverrides(this.getAllDefaults());
     }
   }
 }

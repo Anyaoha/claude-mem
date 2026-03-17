@@ -10,9 +10,29 @@
  */
 
 import path from 'path';
-import { homedir } from 'os';
 import { readFileSync } from 'fs';
 import { logger } from '../../utils/logger.js';
+import { MARKETPLACE_ROOT } from '../../shared/paths.js';
+
+/**
+ * Make an HTTP request to the worker via TCP.
+ * Returns { ok, statusCode, body } or throws on transport error.
+ */
+async function httpRequestToWorker(
+  port: number,
+  endpointPath: string,
+  method: string = 'GET'
+): Promise<{ ok: boolean; statusCode: number; body: string }> {
+  const response = await fetch(`http://127.0.0.1:${port}${endpointPath}`, { method });
+  // Gracefully handle cases where response body isn't available (e.g., test mocks)
+  let body = '';
+  try {
+    body = await response.text();
+  } catch {
+    // Body unavailable — health/readiness checks only need .ok
+  }
+  return { ok: response.ok, statusCode: response.status, body };
+}
 
 /**
  * Check if a port is in use by querying the health endpoint
@@ -29,25 +49,46 @@ export async function isPortInUse(port: number): Promise<boolean> {
 }
 
 /**
- * Wait for the worker to become fully ready (passes readiness check)
- * @param port Worker port to check
- * @param timeoutMs Maximum time to wait in milliseconds
- * @returns true if worker became ready, false if timeout
+ * Poll a worker endpoint until it returns 200 OK or timeout.
+ * Shared implementation for liveness and readiness checks.
  */
-export async function waitForHealth(port: number, timeoutMs: number = 30000): Promise<boolean> {
+async function pollEndpointUntilOk(
+  port: number,
+  endpointPath: string,
+  timeoutMs: number,
+  retryLogMessage: string
+): Promise<boolean> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     try {
-      // Note: Removed AbortSignal.timeout to avoid Windows Bun cleanup issue (libuv assertion)
-      const response = await fetch(`http://127.0.0.1:${port}/api/readiness`);
-      if (response.ok) return true;
+      const result = await httpRequestToWorker(port, endpointPath);
+      if (result.ok) return true;
     } catch (error) {
       // [ANTI-PATTERN IGNORED]: Retry loop - expected failures during startup, will retry
-      logger.debug('SYSTEM', 'Service not ready yet, will retry', { port }, error as Error);
+      logger.debug('SYSTEM', retryLogMessage, {}, error as Error);
     }
     await new Promise(r => setTimeout(r, 500));
   }
   return false;
+}
+
+/**
+ * Wait for the worker HTTP server to become responsive (liveness check).
+ * Uses /api/health which returns 200 as soon as the HTTP server is listening.
+ * For full initialization (DB + search), use waitForReadiness() instead.
+ */
+export function waitForHealth(port: number, timeoutMs: number = 30000): Promise<boolean> {
+  return pollEndpointUntilOk(port, '/api/health', timeoutMs, 'Service not ready yet, will retry');
+}
+
+/**
+ * Wait for the worker to be fully initialized (DB + search ready).
+ * Uses /api/readiness which returns 200 only after core initialization completes.
+ * Now that initializationCompleteFlag is set after DB/search init (not MCP),
+ * this typically completes in a few seconds.
+ */
+export function waitForReadiness(port: number, timeoutMs: number = 30000): Promise<boolean> {
+  return pollEndpointUntilOk(port, '/api/readiness', timeoutMs, 'Worker not ready yet, will retry');
 }
 
 /**
@@ -65,56 +106,61 @@ export async function waitForPortFree(port: number, timeoutMs: number = 10000): 
 
 /**
  * Send HTTP shutdown request to a running worker
- * @param port Worker port
  * @returns true if shutdown request was acknowledged, false otherwise
  */
 export async function httpShutdown(port: number): Promise<boolean> {
   try {
-    // Note: Removed AbortSignal.timeout to avoid Windows Bun cleanup issue (libuv assertion)
-    const response = await fetch(`http://127.0.0.1:${port}/api/admin/shutdown`, {
-      method: 'POST'
-    });
-    if (!response.ok) {
-      logger.warn('SYSTEM', 'Shutdown request returned error', { port, status: response.status });
+    const result = await httpRequestToWorker(port, '/api/admin/shutdown', 'POST');
+    if (!result.ok) {
+      logger.warn('SYSTEM', 'Shutdown request returned error', { status: result.statusCode });
       return false;
     }
     return true;
   } catch (error) {
     // Connection refused is expected if worker already stopped
     if (error instanceof Error && error.message?.includes('ECONNREFUSED')) {
-      logger.debug('SYSTEM', 'Worker already stopped', { port }, error);
+      logger.debug('SYSTEM', 'Worker already stopped', {}, error);
       return false;
     }
     // Unexpected error - log full details
-    logger.error('SYSTEM', 'Shutdown request failed unexpectedly', { port }, error as Error);
+    logger.error('SYSTEM', 'Shutdown request failed unexpectedly', {}, error as Error);
     return false;
   }
 }
 
 /**
  * Get the plugin version from the installed marketplace package.json
- * This is the "expected" version that should be running
+ * This is the "expected" version that should be running.
+ * Returns 'unknown' on ENOENT/EBUSY (shutdown race condition, fix #1042).
  */
 export function getInstalledPluginVersion(): string {
-  const marketplaceRoot = path.join(homedir(), '.claude', 'plugins', 'marketplaces', 'thedotmack');
-  const packageJsonPath = path.join(marketplaceRoot, 'package.json');
-  const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf-8'));
-  return packageJson.version;
+  try {
+    const packageJsonPath = path.join(MARKETPLACE_ROOT, 'package.json');
+    const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf-8'));
+    return packageJson.version;
+  } catch (error: unknown) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'EBUSY') {
+      logger.debug('SYSTEM', 'Could not read plugin version (shutdown race)', { code });
+      return 'unknown';
+    }
+    throw error;
+  }
 }
 
 /**
  * Get the running worker's version via API
- * This is the "actual" version currently running
+ * This is the "actual" version currently running.
  */
 export async function getRunningWorkerVersion(port: number): Promise<string | null> {
   try {
-    const response = await fetch(`http://127.0.0.1:${port}/api/version`);
-    if (!response.ok) return null;
-    const data = await response.json() as { version: string };
+    const result = await httpRequestToWorker(port, '/api/version');
+    if (!result.ok) return null;
+    const data = JSON.parse(result.body) as { version: string };
     return data.version;
   } catch {
     // Expected: worker not running or version endpoint unavailable
-    logger.debug('SYSTEM', 'Could not fetch worker version', { port });
+    logger.debug('SYSTEM', 'Could not fetch worker version', {});
     return null;
   }
 }
@@ -134,8 +180,8 @@ export async function checkVersionMatch(port: number): Promise<VersionCheckResul
   const pluginVersion = getInstalledPluginVersion();
   const workerVersion = await getRunningWorkerVersion(port);
 
-  // If we can't get worker version, assume it matches (graceful degradation)
-  if (!workerVersion) {
+  // If either version is unknown/null, assume match (graceful degradation, fix #1042)
+  if (!workerVersion || pluginVersion === 'unknown') {
     return { matches: true, pluginVersion, workerVersion };
   }
 
