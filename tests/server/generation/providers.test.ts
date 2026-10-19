@@ -1,0 +1,780 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { describe, expect, it } from 'bun:test';
+import { readFileSync } from 'fs';
+import {
+  ServerClassifiedProviderError,
+  classifyHttpProviderError,
+  parseRetryAfterMs,
+} from '../../../src/server/generation/providers/shared/error-classification.js';
+import { classifyClaudeServerError } from '../../../src/server/generation/providers/ClaudeObservationProvider.js';
+import {
+  ClaudeObservationProvider,
+} from '../../../src/server/generation/providers/ClaudeObservationProvider.js';
+import {
+  GeminiObservationProvider,
+  categorizeGeminiBadRequest,
+  classifyGeminiServerError,
+  type GeminiBadRequestCategory,
+} from '../../../src/server/generation/providers/GeminiObservationProvider.js';
+import { ModeManager } from '../../../src/services/domain/ModeManager.js';
+import { parseAgentXml } from '../../../src/sdk/parser.js';
+import { assistantText } from '../../../src/shared/assistant-text.js';
+import { OpenRouterObservationProvider } from '../../../src/server/generation/providers/OpenRouterObservationProvider.js';
+import { buildServerGenerationPrompt } from '../../../src/server/generation/providers/shared/prompt-builder.js';
+import type { ServerGenerationContext } from '../../../src/server/generation/providers/shared/types.js';
+import { SettingsDefaultsManager } from '../../../src/shared/SettingsDefaultsManager.js';
+
+function makeContext(overrides: Partial<{ payload: unknown; serverSessionId: string | null; sourceType: 'agent_event' | 'session_summary' }> = {}): ServerGenerationContext {
+  return {
+    job: {
+      id: 'job-1',
+      projectId: 'proj-1',
+      teamId: 'team-1',
+      agentEventId: 'evt-1',
+      sourceType: overrides.sourceType ?? 'agent_event',
+      sourceId: 'evt-1',
+      serverSessionId: overrides.serverSessionId ?? null,
+      jobType: 'observation_generate_for_event',
+      status: 'processing',
+      idempotencyKey: 'k',
+      bullmqJobId: null,
+      attempts: 1,
+      maxAttempts: 3,
+      nextAttemptAtEpoch: null,
+      lockedAtEpoch: null,
+      lockedBy: null,
+      completedAtEpoch: null,
+      failedAtEpoch: null,
+      cancelledAtEpoch: null,
+      lastError: null,
+      payload: {},
+      createdAtEpoch: 0,
+      updatedAtEpoch: 0,
+    },
+    events: [
+      {
+        id: 'evt-1',
+        projectId: 'proj-1',
+        teamId: 'team-1',
+        serverSessionId: overrides.serverSessionId ?? null,
+        sourceAdapter: 'api',
+        sourceEventId: null,
+        idempotencyKey: 'k',
+        eventType: 'tool_use',
+        payload: overrides.payload ?? { tool: 'bash', input: 'ls' },
+        metadata: {},
+        occurredAtEpoch: 0,
+        receivedAtEpoch: 0,
+        createdAtEpoch: 0,
+      },
+    ],
+    project: {
+      projectId: 'proj-1',
+      teamId: 'team-1',
+      serverSessionId: overrides.serverSessionId ?? null,
+      projectName: 'demo',
+    },
+  };
+}
+
+describe('shared error classification', () => {
+  it('parseRetryAfterMs returns ms for numeric values', () => {
+    expect(parseRetryAfterMs('5')).toBe(5000);
+    expect(parseRetryAfterMs(null)).toBeUndefined();
+  });
+
+  it('classifyHttpProviderError returns rate_limit on 429', () => {
+    const err = classifyHttpProviderError({ status: 429, cause: new Error('rl'), providerLabel: 'X' });
+    expect(err.kind).toBe('rate_limit');
+  });
+
+  it('classifyHttpProviderError returns auth_invalid on 401/403', () => {
+    expect(classifyHttpProviderError({ status: 401, cause: 'x', providerLabel: 'X' }).kind).toBe('auth_invalid');
+    expect(classifyHttpProviderError({ status: 403, cause: 'x', providerLabel: 'X' }).kind).toBe('auth_invalid');
+  });
+
+  it('classifyHttpProviderError detects quota body markers regardless of status', () => {
+    const err = classifyHttpProviderError({
+      status: 500,
+      bodyText: 'RESOURCE_EXHAUSTED',
+      cause: new Error(''),
+      providerLabel: 'Gemini',
+    });
+    expect(err.kind).toBe('quota_exhausted');
+  });
+
+  // Mirror of the worker classifier's OpenRouter marker list (Phase 2): the
+  // "Key limit exceeded" body arrives on a 403, "Rate limit exceeded" on a
+  // 429 stays a rate limit, and a bare 402 is quota with no body marker.
+  it('classifyHttpProviderError maps a 403 "Key limit exceeded" body to quota_exhausted', () => {
+    const err = classifyHttpProviderError({
+      status: 403,
+      bodyText: 'Key limit exceeded (total limit). Manage it using https://openrouter.ai/keys/abc',
+      cause: new Error(''),
+      providerLabel: 'OpenRouter',
+    });
+    expect(err.kind).toBe('quota_exhausted');
+  });
+
+  it('classifyHttpProviderError keeps a 429 "Rate limit exceeded" body as rate_limit', () => {
+    const err = classifyHttpProviderError({
+      status: 429,
+      bodyText: 'Rate limit exceeded',
+      cause: new Error(''),
+      providerLabel: 'OpenRouter',
+    });
+    expect(err.kind).toBe('rate_limit');
+  });
+
+  it('classifyHttpProviderError no longer reads a 429 RESOURCE_EXHAUSTED body as a spent quota', () => {
+    // Gemini stamps that status string on *every* 429, so on the 429 path it
+    // says nothing about which allowance ran out. The 500 case above still
+    // resolves by marker — only the 429 path is excluded, exactly as the
+    // generic `limit exceeded` marker beside it already was.
+    const err = classifyHttpProviderError({
+      status: 429,
+      bodyText: 'RESOURCE_EXHAUSTED',
+      cause: new Error(''),
+      providerLabel: 'Gemini',
+    });
+    expect(err.kind).toBe('rate_limit');
+  });
+
+  it('classifyHttpProviderError maps a bare 402 to quota_exhausted', () => {
+    const err = classifyHttpProviderError({
+      status: 402,
+      cause: new Error(''),
+      providerLabel: 'OpenRouter',
+    });
+    expect(err.kind).toBe('quota_exhausted');
+  });
+
+  it('classifyHttpProviderError redacts fallback response bodies from message and cause', () => {
+    const rawBody = 'RAW_PROVIDER_BODY with credential sk-secret';
+    const err = classifyHttpProviderError({
+      status: 418,
+      bodyText: rawBody,
+      cause: new Error(`provider said ${rawBody}`),
+      providerLabel: 'Gemini',
+    });
+    expect(err.kind).toBe('unrecoverable');
+    expect(err.message).toBe('Gemini API error (status 418)');
+    expect(err.message).not.toContain(rawBody);
+    expect(err.cause).toBeInstanceOf(Error);
+    expect((err.cause as Error).message).toContain('status 418');
+    expect((err.cause as Error).message).not.toContain(rawBody);
+  });
+
+  // Never pay twice (Phase 1): the call was billed, only its output was lost;
+  // this used to be transient (BullMQ-retried) and is now never retried.
+  it('classifyHttpProviderError treats a 2xx body-level litellm parse error as a non-retried output failure', () => {
+    const err = classifyHttpProviderError({
+      status: 200,
+      bodyText: '200 Unable to get json response - Expecting value: line 45 column 1',
+      cause: new Error('OpenRouter API error: 200 - Unable to get json response'),
+      providerLabel: 'OpenRouter',
+    });
+    expect(err.kind).toBe('unrecoverable');
+    expect(err.paidSendOutcome).toBe('output_failure');
+  });
+
+  it('classifyClaudeServerError treats 529 as transient', () => {
+    expect(classifyClaudeServerError({ status: 529, cause: 'x' }).kind).toBe('transient');
+  });
+
+  it('classifyClaudeServerError treats prompt-too-long as unrecoverable', () => {
+    expect(
+      classifyClaudeServerError({ status: 400, bodyText: 'prompt is too long', cause: 'x' }).kind,
+    ).toBe('unrecoverable');
+  });
+});
+
+describe('buildServerGenerationPrompt', () => {
+  // A session_summary job is a different task, and its persistence path only
+  // understands a <summary> block. Asking it for <observation> produced responses
+  // that the summary path discarded without a trace.
+  it('asks for a <summary> block on session_summary jobs', () => {
+    const result = buildServerGenerationPrompt(makeContext({ sourceType: 'session_summary' }));
+    expect(result.prompt).toContain('<summary>...</summary>');
+    expect(result.prompt).toContain('<request>');
+    expect(result.prompt).toContain('<learned>');
+    expect(result.prompt).toContain('<next_steps>');
+  });
+
+  it('does not ask a session_summary job for <observation> blocks', () => {
+    const result = buildServerGenerationPrompt(makeContext({ sourceType: 'session_summary' }));
+    expect(result.prompt).not.toContain('<observation>...</observation>');
+  });
+
+  it('still asks for <observation> blocks on agent_event jobs', () => {
+    const result = buildServerGenerationPrompt(makeContext());
+    expect(result.prompt).toContain('<observation>...</observation>');
+    expect(result.prompt).not.toContain('<summary>...</summary>');
+  });
+
+  it('keeps offering the skip escape hatch on both job types', () => {
+    for (const sourceType of ['agent_event', 'session_summary'] as const) {
+      expect(buildServerGenerationPrompt(makeContext({ sourceType })).prompt)
+        .toContain('<skip_summary />');
+    }
+  });
+
+  it('strips <private> tags from event payload before sending', () => {
+    const context = makeContext({
+      payload: '<private>secret</private>visible',
+    });
+    const result = buildServerGenerationPrompt(context);
+    expect(result.prompt).not.toContain('secret');
+    expect(result.prompt).toContain('visible');
+    expect(result.hadPrivateContent).toBe(true);
+    expect(result.skippedAll).toBe(false);
+  });
+
+  it('marks skippedAll when every event is fully private', () => {
+    const context = makeContext({ payload: '<private>secret</private>' });
+    const result = buildServerGenerationPrompt(context);
+    expect(result.skippedAll).toBe(true);
+    expect(result.hadPrivateContent).toBe(true);
+  });
+
+  it('renders an object payload as compact JSON, escaping only &, < and >', () => {
+    const { prompt } = buildServerGenerationPrompt(makeContext({ payload: { cmd: 'echo "a<b" && ls', n: 1 } }));
+    expect(prompt).toContain(String.raw`{"cmd":"echo \"a&lt;b\" &amp;&amp; ls","n":1}`);
+    expect(prompt).not.toContain('&quot;');
+  });
+
+  it('sends the folder label but none of the ids the model never needs', () => {
+    const result = buildServerGenerationPrompt(makeContext({ serverSessionId: 'session-x' }));
+    expect(result.prompt).toContain('<project_name>demo</project_name>');
+    for (const id of ['job-1', 'session-x', '<project_id>', '<team_id>', '<generation_job_id>', '<server_session_id>']) {
+      expect(result.prompt).not.toContain(id);
+    }
+  });
+});
+
+class FakeFetch {
+  constructor(private readonly response: Response | (() => Response)) {}
+  fetch: typeof fetch = async () => {
+    return typeof this.response === 'function' ? this.response() : this.response;
+  };
+}
+
+class CapturingFetch {
+  lastUrl: string | undefined;
+  lastInit: RequestInit | undefined;
+  constructor(private readonly response: Response) {}
+  fetch: typeof fetch = async (input, init) => {
+    this.lastUrl = typeof input === 'string' ? input : input.toString();
+    this.lastInit = init;
+    return this.response;
+  };
+}
+
+function jsonResponse(status: number, body: unknown, headers?: Record<string, string>): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...(headers ?? {}) },
+  });
+}
+
+describe('ClaudeObservationProvider', () => {
+  it('returns synthetic skip when prompt builder reports skippedAll', async () => {
+    const provider = new ClaudeObservationProvider({ apiKey: 'fake', fetchImpl: async () => {
+      throw new Error('should not be called');
+    } });
+    const context = makeContext({ payload: '<private>secret</private>' });
+    const result = await provider.generate(context);
+    expect(result.rawText).toContain('<skip_summary');
+  });
+
+  it('parses Anthropic Messages text content into rawText', async () => {
+    const fakeFetch = new FakeFetch(
+      jsonResponse(200, {
+        content: [
+          { type: 'text', text: '<observation><type>x</type><title>t</title></observation>' },
+        ],
+        usage: { input_tokens: 10, output_tokens: 20 },
+      }),
+    );
+    const provider = new ClaudeObservationProvider({
+      apiKey: 'sk-fake',
+      fetchImpl: fakeFetch.fetch,
+    });
+    const result = await provider.generate(makeContext());
+    expect(result.rawText).toContain('<observation>');
+    expect(result.tokensUsed).toBe(30);
+    expect(result.providerLabel).toBe('claude');
+  });
+
+  it('classifies non-OK responses through classifyClaudeServerError', async () => {
+    const fakeFetch = new FakeFetch(jsonResponse(401, { error: { message: 'Invalid API key' } }));
+    const provider = new ClaudeObservationProvider({ apiKey: 'sk-fake', fetchImpl: fakeFetch.fetch });
+    await expect(provider.generate(makeContext())).rejects.toBeInstanceOf(ServerClassifiedProviderError);
+  });
+
+  it('POSTs to api.anthropic.com when baseUrl is unset', async () => {
+    const capturing = new CapturingFetch(jsonResponse(200, { content: [{ type: 'text', text: 'ok' }] }));
+    const provider = new ClaudeObservationProvider({ apiKey: 'sk-fake', fetchImpl: capturing.fetch });
+    await provider.generate(makeContext());
+    expect(capturing.lastUrl).toBe('https://api.anthropic.com/v1/messages');
+  });
+
+  it('POSTs to a custom gateway baseUrl, appending /v1/messages', async () => {
+    const capturing = new CapturingFetch(jsonResponse(200, { content: [{ type: 'text', text: 'ok' }] }));
+    const provider = new ClaudeObservationProvider({
+      apiKey: 'sk-fake',
+      baseUrl: 'https://gateway.example.com/api/anthropic',
+      fetchImpl: capturing.fetch,
+    });
+    await provider.generate(makeContext());
+    expect(capturing.lastUrl).toBe('https://gateway.example.com/api/anthropic/v1/messages');
+  });
+
+  it('trims whitespace and strips a trailing slash from baseUrl', async () => {
+    const capturing = new CapturingFetch(jsonResponse(200, { content: [{ type: 'text', text: 'ok' }] }));
+    const provider = new ClaudeObservationProvider({
+      apiKey: 'sk-fake',
+      baseUrl: '  https://gateway.example.com/api/anthropic/  ',
+      fetchImpl: capturing.fetch,
+    });
+    await provider.generate(makeContext());
+    expect(capturing.lastUrl).toBe('https://gateway.example.com/api/anthropic/v1/messages');
+  });
+});
+
+describe('GeminiObservationProvider', () => {
+  const closedBadRequestCategories = new Set<GeminiBadRequestCategory>([
+    'role_sequence',
+    'context_limit',
+    'model_unsupported',
+    'api_key',
+    'unknown_bad_request',
+  ]);
+
+  for (const [expectedCategory, bodyText] of [
+    ['role_sequence', 'Please ensure that multiturn requests alternate between user and model.'],
+    ['context_limit', 'Request contains 120000 tokens which exceeds the maximum token limit.'],
+    ['model_unsupported', 'Model gemini-example is not supported for generateContent.'],
+    ['api_key', 'API_KEY_INVALID: API key not valid.'],
+    ['unknown_bad_request', 'Invalid JSON payload received. Unknown name "foo".'],
+  ] as const) {
+    it(`classifies Gemini 400 as closed category ${expectedCategory}`, () => {
+      const rawBody = `${bodyText} RAW_PROVIDER_BODY`;
+      const category = categorizeGeminiBadRequest(rawBody);
+      const err = classifyGeminiServerError({
+        status: 400,
+        bodyText: rawBody,
+        cause: new Error(`Gemini API error: 400 - ${rawBody}`),
+      });
+
+      expect(category).toBe(expectedCategory);
+      expect(closedBadRequestCategories.has(category)).toBe(true);
+      // A refused key is a refused credential; the rest are bad requests.
+      if (expectedCategory === 'api_key') {
+        expect(err.kind).toBe('auth_invalid');
+        expect(err.message).toBe('Gemini auth invalid (status 400)');
+      } else {
+        expect(err.kind).toBe('unrecoverable');
+        expect(err.message).toBe(`Gemini bad request: ${expectedCategory}`);
+      }
+      expect(err.message).not.toContain('RAW_PROVIDER_BODY');
+      expect(err.cause).toBeInstanceOf(Error);
+      expect((err.cause as Error).message).toContain('status 400');
+      expect((err.cause as Error).message).not.toContain('RAW_PROVIDER_BODY');
+    });
+  }
+
+  const PER_MINUTE = 'GenerateContentInputTokensPerModelPerMinute-FreeTier';
+  const PER_DAY = 'GenerateContentInputTokensPerModelPerDay-FreeTier';
+
+  /**
+   * A 429 body in the shape Gemini actually sends, captured from the live
+   * endpoint: every one carries `RESOURCE_EXHAUSTED`, the retry hint is in the
+   * body because Google sends no `Retry-After` header, and the window that ran
+   * out is named by the `quotaId`s. A spent period quota lists its per-minute
+   * window alongside the period one, which is why the per-minute violation
+   * cannot be the discriminator.
+   */
+  function quotaFailureBody(quotaIds: string[], retryDelay = '11s'): string {
+    return JSON.stringify({
+      error: {
+        code: 429,
+        message: 'You exceeded your current quota, please check your plan and billing details.',
+        status: 'RESOURCE_EXHAUSTED',
+        details: [
+          {
+            '@type': 'type.googleapis.com/google.rpc.QuotaFailure',
+            violations: quotaIds.map(quotaId => ({
+              quotaMetric: 'generativelanguage.googleapis.com/generate_content_free_tier_input_token_count',
+              quotaId,
+              quotaValue: '250000',
+            })),
+          },
+          { '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay },
+        ],
+      },
+    });
+  }
+
+  it('reads a per-minute-only 429 as a rate limit and keeps the body retry hint', () => {
+    const err = classifyGeminiServerError({
+      status: 429,
+      bodyText: quotaFailureBody([PER_MINUTE]),
+      cause: new Error(''),
+    });
+
+    expect(err.kind).toBe('rate_limit');
+    // No Retry-After header on these, so the body is the only hint there is.
+    expect(err.retryAfterMs).toBe(11000);
+  });
+
+  it('reads a 429 that also names a period window as the exhausted allowance', () => {
+    const err = classifyGeminiServerError({
+      status: 429,
+      bodyText: quotaFailureBody([PER_MINUTE, PER_DAY]),
+      cause: new Error(''),
+    });
+
+    expect(err.kind).toBe('quota_exhausted');
+  });
+
+  it('lets a Retry-After header win over the body hint when one is present', () => {
+    const err = classifyGeminiServerError({
+      status: 429,
+      bodyText: quotaFailureBody([PER_MINUTE]),
+      headers: new Headers({ 'retry-after': '3' }),
+      cause: new Error(''),
+    });
+
+    expect(err.retryAfterMs).toBe(3000);
+  });
+
+  it('returns the answer rather than the reasoning when a thought part comes first', async () => {
+    const fakeFetch = new FakeFetch(
+      jsonResponse(200, {
+        candidates: [{
+          content: {
+            parts: [
+              // Captured shape with `thinkingConfig.includeThoughts`.
+              { text: 'The user wants an observation, so I should emit XML.', thought: true },
+              { text: '<observation><type>x</type><title>Answer</title></observation>' },
+            ],
+          },
+        }],
+        usageMetadata: { totalTokenCount: 42 },
+      }),
+    );
+    const provider = new GeminiObservationProvider({ apiKey: 'fake', fetchImpl: fakeFetch.fetch });
+
+    const result = await provider.generate(makeContext());
+
+    expect(result.rawText).toBe('<observation><type>x</type><title>Answer</title></observation>');
+    expect(result.tokensUsed).toBe(42);
+  });
+
+  it('joins an answer that Gemini split across several parts', async () => {
+    const fakeFetch = new FakeFetch(
+      jsonResponse(200, {
+        candidates: [{
+          content: {
+            parts: [
+              { text: '<observation><type>x</type>' },
+              { text: '<title>Split</title></observation>' },
+            ],
+          },
+        }],
+      }),
+    );
+    const provider = new GeminiObservationProvider({ apiKey: 'fake', fetchImpl: fakeFetch.fetch });
+
+    const result = await provider.generate(makeContext());
+
+    expect(result.rawText).toBe('<observation><type>x</type><title>Split</title></observation>');
+  });
+
+  it('parses generateContent response into rawText', async () => {
+    const fakeFetch = new FakeFetch(
+      jsonResponse(200, {
+        candidates: [{ content: { parts: [{ text: '<observation><type>x</type><title>g</title></observation>' }] } }],
+        usageMetadata: { totalTokenCount: 42 },
+      }),
+    );
+    const provider = new GeminiObservationProvider({ apiKey: 'fake', fetchImpl: fakeFetch.fetch });
+    const result = await provider.generate(makeContext());
+    expect(result.rawText).toContain('<observation>');
+    expect(result.tokensUsed).toBe(42);
+    expect(result.providerLabel).toBe('gemini');
+  });
+
+  it('redacts raw Gemini 400 response body from top-level message and cause', async () => {
+    const rawBody = 'Please ensure that multiturn requests alternate between user and model. RAW_PROVIDER_BODY';
+    const fakeFetch = new FakeFetch(new Response(rawBody, { status: 400 }));
+    const provider = new GeminiObservationProvider({ apiKey: 'fake', fetchImpl: fakeFetch.fetch });
+
+    try {
+      await provider.generate(makeContext());
+      expect.unreachable();
+    } catch (error) {
+      expect(error).toBeInstanceOf(ServerClassifiedProviderError);
+      const classified = error as ServerClassifiedProviderError;
+      expect(classified.kind).toBe('unrecoverable');
+      expect(classified.message).toBe('Gemini bad request: role_sequence');
+      expect(classified.message).not.toContain('RAW_PROVIDER_BODY');
+      expect(classified.cause).toBeInstanceOf(Error);
+      expect((classified.cause as Error).message).not.toContain('RAW_PROVIDER_BODY');
+    }
+  });
+
+  it('redacts raw Gemini non-400 response body from top-level message and cause', async () => {
+    const rawBody = 'RAW_PROVIDER_BODY with credential sk-secret';
+    const fakeFetch = new FakeFetch(new Response(rawBody, { status: 418 }));
+    const provider = new GeminiObservationProvider({ apiKey: 'fake', fetchImpl: fakeFetch.fetch });
+
+    try {
+      await provider.generate(makeContext());
+      expect.unreachable();
+    } catch (error) {
+      expect(error).toBeInstanceOf(ServerClassifiedProviderError);
+      const classified = error as ServerClassifiedProviderError;
+      expect(classified.kind).toBe('unrecoverable');
+      expect(classified.message).toBe('Gemini API error (status 418)');
+      expect(classified.message).not.toContain(rawBody);
+      expect(classified.cause).toBeInstanceOf(Error);
+      expect((classified.cause as Error).message).toContain('status 418');
+      expect((classified.cause as Error).message).not.toContain(rawBody);
+    }
+  });
+
+  it('redacts raw Gemini response error message when HTTP status is OK', async () => {
+    const rawMessage = 'RAW_PROVIDER_BODY from data.error.message';
+    const fakeFetch = new FakeFetch(
+      jsonResponse(200, {
+        error: { status: 'FAILED_PRECONDITION', message: rawMessage },
+      }),
+    );
+    const provider = new GeminiObservationProvider({ apiKey: 'fake', fetchImpl: fakeFetch.fetch });
+
+    try {
+      await provider.generate(makeContext());
+      expect.unreachable();
+    } catch (error) {
+      expect(error).toBeInstanceOf(ServerClassifiedProviderError);
+      const classified = error as ServerClassifiedProviderError;
+      expect(classified.kind).toBe('unrecoverable');
+      expect(classified.message).toBe('Gemini API error (status 200)');
+      expect(classified.message).not.toContain(rawMessage);
+      expect(classified.cause).toBeInstanceOf(Error);
+      expect((classified.cause as Error).message).toContain('status 200');
+      expect((classified.cause as Error).message).not.toContain(rawMessage);
+    }
+  });
+});
+
+describe('OpenRouterObservationProvider', () => {
+  it('preserves XML tags and words split across content blocks without changing worker separation', async () => {
+    const xml = '<observation><type>discovery</type><title>Native answer</title><narrative>Reliable extraction</narrative></observation>';
+    const content = [{ type: 'text', text: '<observ' }, { type: 'reasoning', text: 'private' }, { type: 'text', text: xml.slice(7) }];
+    const provider = new OpenRouterObservationProvider({ apiKey: 'fake', fetchImpl: async () => jsonResponse(200, { choices: [{ message: { content } }] }) });
+    const response = await provider.generate(makeContext());
+    expect(response.rawText).toBe(xml);
+    ModeManager.getInstance().loadMode('code');
+    expect(parseAgentXml(response.rawText, 'boundary').valid).toBe(true);
+    expect(parseAgentXml(response.rawText, 'boundary').observations[0].title).toBe('Native answer');
+    expect(assistantText([{ type: 'text', text: 'first' }, { type: 'text', text: 'second' }])).toBe('first\nsecond');
+  });
+
+  it('extracts text blocks from successful compatible responses without leaking reasoning', async () => {
+    const provider = new OpenRouterObservationProvider({
+      apiKey: 'fake',
+      fetchImpl: async () => jsonResponse(200, {
+        choices: [{ message: { content: [
+          { type: 'reasoning', text: 'private reasoning' },
+          { type: 'text', text: '<observation>first' },
+          { type: 'text', text: 'second</observation>' },
+          { type: 'tool_call', arguments: 'not an answer' },
+          null,
+        ] } }],
+        usage: { total_tokens: 11 },
+      }),
+    });
+    const result = await provider.generate(makeContext());
+    expect(result.rawText).toBe('<observation>firstsecond</observation>');
+    expect(result.tokensUsed).toBe(11);
+  });
+
+  it('treats non-text compatible response content as empty', async () => {
+    const nonTextContents = [
+      null,
+      42,
+      { text: 'not a content block array' },
+      [{ type: 'reasoning', text: 'private' }],
+    ];
+    for (const content of nonTextContents) {
+      const provider = new OpenRouterObservationProvider({
+        apiKey: 'fake',
+        fetchImpl: async () => jsonResponse(200, { choices: [{ message: { content } }] }),
+      });
+      expect((await provider.generate(makeContext())).rawText).toBe('');
+    }
+  });
+
+  it('retries the exact token-field compatibility response', async () => {
+    const issueReport = readFileSync(new URL('../../fixtures/claude-mem-issue-3712.md', import.meta.url), 'utf8');
+    const compatibilityError = issueReport.match(/Unsupported parameter:[\s\S]*?instead\./)?.[0] ?? '';
+    const requests: RequestInit[] = [];
+    const responses = [
+      jsonResponse(400, { error: { message: compatibilityError } }),
+      jsonResponse(200, { choices: [{ message: { content: '<observation>ok</observation>' } }], usage: { total_tokens: 11 } }),
+    ];
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      requests.push(init ?? {});
+      return responses.shift()!;
+    };
+    const provider = new OpenRouterObservationProvider({ apiKey: 'fake', model: 'gpt-5', fetchImpl });
+
+    const result = await provider.generate(makeContext());
+
+    expect(result.rawText).toBe('<observation>ok</observation>');
+    expect(result.tokensUsed).toBe(11);
+    expect(requests).toHaveLength(2);
+    const first = JSON.parse(String(requests[0].body)) as Record<string, unknown>;
+    const second = JSON.parse(String(requests[1].body)) as Record<string, unknown>;
+    expect(second.max_completion_tokens).toBe(first.max_tokens);
+    expect(second.max_tokens).toBeUndefined();
+    expect(second.model).toBe(first.model);
+    expect(second.messages).toEqual(first.messages);
+  });
+
+  it('does not retry a similar incomplete compatibility response', async () => {
+    let calls = 0;
+    const provider = new OpenRouterObservationProvider({
+      apiKey: 'fake',
+      fetchImpl: async () => {
+        calls += 1;
+        return jsonResponse(400, { error: { message: "Unsupported parameter: 'max_tokens' is not supported with this model." } });
+      },
+    });
+
+    await expect(provider.generate(makeContext())).rejects.toBeInstanceOf(ServerClassifiedProviderError);
+    expect(calls).toBe(1);
+  });
+
+  // Wave 3 gate R4-10: a gateway that streams unless told otherwise answers
+  // with text/event-stream, which response.json() cannot read, so every server
+  // job failed. The worker sends stream:false since #3668; the server now does
+  // too, except to the cmem gateway, which never streams unasked. `stream` is
+  // protected from CLAUDE_MEM_OPENROUTER_EXTRA_BODY, so this was the only fix.
+  it('asks for one JSON body (stream:false), except from the cmem gateway', async () => {
+    const bodyFor = async (baseUrl?: string): Promise<Record<string, unknown>> => {
+      let body: Record<string, unknown> = {};
+      const provider = new OpenRouterObservationProvider({
+        apiKey: 'fake',
+        ...(baseUrl ? { baseUrl } : {}),
+        extraBody: { stream: true },
+        fetchImpl: async (_input, init) => {
+          body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+          return jsonResponse(200, { choices: [{ message: { content: '<observation>ok</observation>' } }] });
+        },
+      });
+      await provider.generate(makeContext());
+      return body;
+    };
+
+    expect((await bodyFor()).stream).toBe(false);
+    expect((await bodyFor('https://gateway.example.test/v1')).stream).toBe(false);
+    expect('stream' in await bodyFor('https://cmem.ai/api/inference/v1')).toBe(false);
+  });
+
+  it('parses OpenAI-style response and reports tokensUsed', async () => {
+    const fakeFetch = new FakeFetch(
+      jsonResponse(200, {
+        choices: [{ message: { content: '<observation><type>x</type><title>o</title></observation>' } }],
+        usage: { total_tokens: 100 },
+      }),
+    );
+    const provider = new OpenRouterObservationProvider({ apiKey: 'fake', fetchImpl: fakeFetch.fetch });
+    const result = await provider.generate(makeContext());
+    expect(result.rawText).toContain('<observation>');
+    expect(result.tokensUsed).toBe(100);
+    expect(result.providerLabel).toBe('openrouter');
+  });
+
+  it('classifies a 429 response as rate_limit', async () => {
+    const fakeFetch = new FakeFetch(jsonResponse(429, { error: { message: 'rl' } }));
+    const provider = new OpenRouterObservationProvider({ apiKey: 'fake', fetchImpl: fakeFetch.fetch });
+    try {
+      await provider.generate(makeContext());
+      expect.unreachable();
+    } catch (error) {
+      expect(error).toBeInstanceOf(ServerClassifiedProviderError);
+      expect((error as ServerClassifiedProviderError).kind).toBe('rate_limit');
+    }
+  });
+
+  // #2382/#2590/#2622/#2393 — configurable OpenAI-compatible base URL.
+  it('POSTs to the default OpenRouter URL when baseUrl is unset', async () => {
+    const capturing = new CapturingFetch(
+      jsonResponse(200, { choices: [{ message: { content: 'ok' } }] }),
+    );
+    const provider = new OpenRouterObservationProvider({ apiKey: 'fake', fetchImpl: capturing.fetch });
+    await provider.generate(makeContext());
+    expect(capturing.lastUrl).toBe('https://openrouter.ai/api/v1/chat/completions');
+  });
+
+  it('appends /chat/completions to a DeepSeek-style base URL', async () => {
+    const capturing = new CapturingFetch(
+      jsonResponse(200, { choices: [{ message: { content: 'ok' } }] }),
+    );
+    const provider = new OpenRouterObservationProvider({
+      apiKey: 'fake',
+      baseUrl: 'https://api.deepseek.com',
+      fetchImpl: capturing.fetch,
+    });
+    await provider.generate(makeContext());
+    expect(capturing.lastUrl).toBe('https://api.deepseek.com/chat/completions');
+  });
+
+  it('uses a full chat/completions base URL verbatim and normalizes trailing slash', async () => {
+    const capturing = new CapturingFetch(
+      jsonResponse(200, { choices: [{ message: { content: 'ok' } }] }),
+    );
+    const provider = new OpenRouterObservationProvider({
+      apiKey: 'fake',
+      baseUrl: 'http://localhost:1234/v1/chat/completions/',
+      fetchImpl: capturing.fetch,
+    });
+    await provider.generate(makeContext());
+    expect(capturing.lastUrl).toBe('http://localhost:1234/v1/chat/completions');
+  });
+
+  it('sends the configured model verbatim in the request body (#2393)', async () => {
+    const capturing = new CapturingFetch(
+      jsonResponse(200, { choices: [{ message: { content: 'ok' } }] }),
+    );
+    const provider = new OpenRouterObservationProvider({
+      apiKey: 'fake',
+      baseUrl: 'https://api.deepseek.com',
+      model: 'deepseek-chat',
+      fetchImpl: capturing.fetch,
+    });
+    await provider.generate(makeContext());
+    const body = JSON.parse(String(capturing.lastInit?.body)) as { model?: string };
+    expect(body.model).toBe('deepseek-chat');
+  });
+
+  it('defaults to the worker OpenRouter model, not the retired anthropic/claude-3.5-sonnet', async () => {
+    const capturing = new CapturingFetch(
+      jsonResponse(200, { choices: [{ message: { content: 'ok' } }] }),
+    );
+    const provider = new OpenRouterObservationProvider({ apiKey: 'fake', fetchImpl: capturing.fetch });
+
+    const result = await provider.generate(makeContext());
+
+    const body = JSON.parse(String(capturing.lastInit?.body)) as { model?: string };
+    const workerDefault = SettingsDefaultsManager.getAllDefaults().CLAUDE_MEM_OPENROUTER_MODEL;
+    expect(body.model).toBe(workerDefault);
+    expect(body.model).not.toBe('anthropic/claude-3.5-sonnet');
+    expect(result.modelId).toBe(workerDefault);
+  });
+});

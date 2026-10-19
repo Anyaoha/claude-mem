@@ -1,45 +1,72 @@
-/**
- * Search Types - Type definitions for the search module
- * Centralizes all search-related types, options, and result interfaces
- */
 
 import type { ObservationSearchResult, SessionSummarySearchResult, UserPromptSearchResult, SearchOptions, DateRange } from '../../sqlite/types.js';
 
-// Re-export base types for convenience
 export type { ObservationSearchResult, SessionSummarySearchResult, UserPromptSearchResult, SearchOptions, DateRange };
 
-/**
- * Constants used across search strategies
- */
 export const SEARCH_CONSTANTS = {
-  RECENCY_WINDOW_DAYS: 90,
   RECENCY_WINDOW_MS: 90 * 24 * 60 * 60 * 1000,
   DEFAULT_LIMIT: 20,
   CHROMA_BATCH_SIZE: 100
 } as const;
 
 /**
- * Document types stored in Chroma
+ * Parse CLAUDE_MEM_SEARCH_RECENCY_DAYS into the implicit recency window, in
+ * milliseconds, that date-less semantic searches apply (the 90-day default).
+ * Absent or empty keeps the default; `0` disables the window so every
+ * semantic match stays eligible; a positive integer sets the window in days.
+ * settings.json is hand-editable JSON and SettingsDefaultsManager leaves JSON
+ * numbers untouched, so the value can also arrive as a real number: numeric
+ * days parse exactly like their string spelling. A present but malformed
+ * value — including an explicit null or any other non-string type — returns
+ * null: the caller warns and keeps the default. An explicit `dateRange` on a
+ * request always wins over this.
  */
-export type ChromaDocType = 'observation' | 'session_summary' | 'user_prompt';
-
-/**
- * Chroma query result with typed metadata
- */
-export interface ChromaQueryResult {
-  ids: number[];
-  distances: number[];
-  metadatas: ChromaMetadata[];
+export function parseSearchRecencyWindowMs(raw: unknown): number | null {
+  if (raw === undefined || (typeof raw === 'string' && raw.trim() === '')) return SEARCH_CONSTANTS.RECENCY_WINDOW_MS;
+  if (typeof raw === 'number') {
+    const milliseconds = raw * 86_400_000;
+    if (!Number.isInteger(raw) || raw < 0 || !Number.isSafeInteger(milliseconds)) return null;
+    return milliseconds;
+  }
+  if (typeof raw !== 'string') return null;
+  if (raw.trim() === '0') return 0;
+  const days = Number(raw.trim());
+  const milliseconds = days * 86_400_000;
+  if (!Number.isInteger(days) || days < 0 || !Number.isSafeInteger(milliseconds)) return null;
+  return milliseconds;
 }
 
-/**
- * Metadata stored with each Chroma document
- */
+export type ChromaDocType = 'observation' | 'session_summary' | 'user_prompt';
+
+export const SEARCH_CATEGORIES = ['observations', 'sessions', 'prompts'] as const;
+
+export type SearchCategory = typeof SEARCH_CATEGORIES[number];
+
+export type SearchSelection = SearchCategory | SearchCategory[] | 'all';
+
+export function isCategoryRequested(
+  searchType: SearchSelection | undefined,
+  category: SearchCategory
+): boolean {
+  return !searchType || searchType === 'all' || (Array.isArray(searchType) ? searchType.includes(category) : searchType === category);
+}
+
+/** Scope the candidate budget to the selected document categories. */
+export function buildCategoryWhereFilter(searchType: SearchSelection | undefined): Record<string, unknown> | undefined {
+  if (!searchType || searchType === 'all') return undefined;
+  const docTypes: Record<SearchCategory, ChromaDocType> = {
+    observations: 'observation', sessions: 'session_summary', prompts: 'user_prompt'
+  };
+  const selected = Array.isArray(searchType) ? [...new Set(searchType)] : [searchType];
+  return { doc_type: selected.length === 1 ? docTypes[selected[0]] : { $in: selected.map(category => docTypes[category]) } };
+}
+
 export interface ChromaMetadata {
   sqlite_id: number;
   doc_type: ChromaDocType;
   memory_session_id: string;
   project: string;
+  platform_source?: string;
   created_at_epoch: number;
   type?: string;
   title?: string;
@@ -51,67 +78,41 @@ export interface ChromaMetadata {
   prompt_number?: number;
 }
 
-/**
- * Unified search result type for all document types
- */
 export type SearchResult = ObservationSearchResult | SessionSummarySearchResult | UserPromptSearchResult;
 
-/**
- * Search results container with categorized results
- */
 export interface SearchResults {
   observations: ObservationSearchResult[];
   sessions: SessionSummarySearchResult[];
   prompts: UserPromptSearchResult[];
 }
 
-/**
- * Extended search options for the search module
- */
 export interface ExtendedSearchOptions extends SearchOptions {
-  /** Type filter for search API (observations, sessions, prompts) */
-  searchType?: 'observations' | 'sessions' | 'prompts' | 'all';
-  /** Observation type filter (decision, bugfix, feature, etc.) */
+  searchType?: SearchSelection;
   obsType?: string | string[];
-  /** Concept tags to filter by */
   concepts?: string | string[];
-  /** File paths to filter by */
   files?: string | string[];
-  /** Output format */
   format?: 'text' | 'json';
+  /**
+   * Skip the implicit 90-day window Chroma results get when no dateRange is given. Corpus
+   * builds set it: a corpus is defined by its stored filter, so a date-less corpus must not
+   * lose everything older than 90 days each time it is rebuilt.
+   */
+  ignoreDefaultRecencyWindow?: boolean;
 }
 
-/**
- * Search strategy selection hint
- */
 export type SearchStrategyHint = 'chroma' | 'sqlite' | 'hybrid' | 'auto';
 
-/**
- * Options passed to search strategies
- */
 export interface StrategySearchOptions extends ExtendedSearchOptions {
-  /** Query text for semantic search (optional for filter-only queries) */
   query?: string;
-  /** Force a specific strategy */
   strategyHint?: SearchStrategyHint;
 }
 
-/**
- * Result from a search strategy
- */
 export interface StrategySearchResult {
   results: SearchResults;
-  /** Whether Chroma was used successfully */
   usedChroma: boolean;
-  /** Whether fallback was triggered */
-  fellBack: boolean;
-  /** Strategy that produced the results */
   strategy: SearchStrategyHint;
 }
 
-/**
- * Combined result type for timeline items
- */
 export interface CombinedResult {
   type: 'observation' | 'session' | 'prompt';
   data: SearchResult;

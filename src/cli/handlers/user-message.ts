@@ -1,56 +1,58 @@
-/**
- * User Message Handler - SessionStart (parallel)
- *
- * Displays context info to user via stderr.
- * Uses exit code 0 (SUCCESS) - stderr is not shown to Claude with exit 0.
- */
-
-import { basename } from 'path';
 import type { EventHandler, NormalizedHookInput, HookResult } from '../types.js';
-import { ensureWorkerRunning, getWorkerPort, workerHttpRequest } from '../../shared/worker-utils.js';
+import {
+  executeWithWorkerFallback,
+  isWorkerFallback,
+  getWorkerPort,
+  getViewerBaseUrl,
+} from '../../shared/worker-utils.js';
 import { HOOK_EXIT_CODES } from '../../shared/hook-constants.js';
+import { normalizePlatformSource } from '../../shared/platform-source.js';
+import { proTrialLine } from '../../shared/pro-promo.js';
+import { shouldTrackProject } from '../../shared/should-track-project.js';
+import { getProjectContext } from '../../utils/project-name.js';
 
 export const userMessageHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
-    // Ensure worker is running
-    const workerReady = await ensureWorkerRunning();
-    if (!workerReady) {
-      // Worker not available — skip user message gracefully
+    const cwd = input.cwd ?? process.cwd();
+    // Same exclusion gate as SessionStart / file-context / capture. #3511
+    // closed after the SessionStart path honored CLAUDE_MEM_EXCLUDED_PROJECTS,
+    // but UserPromptSubmit still fetched and bannered context for excluded dirs.
+    if (!shouldTrackProject(cwd)) {
       return { exitCode: HOOK_EXIT_CODES.SUCCESS };
     }
 
     const port = getWorkerPort();
-    const project = basename(input.cwd ?? process.cwd());
+    // Use the same project-key resolution as SessionStart/capture (#2663, #3194).
+    // Raw basename(cwd) fragments non-git subdir launches away from parent memory.
+    const context = getProjectContext(cwd);
+    const projectsParam = context.allProjects.join(',');
+    const colorsParam = input.platform === 'claude-code' ? '&colors=true' : '';
+    const platformSourceParam = input.platform
+      ? `&platformSource=${encodeURIComponent(normalizePlatformSource(input.platform))}`
+      : '';
 
-    // Fetch formatted context directly from worker API
-    try {
-      const response = await workerHttpRequest(
-        `/api/context/inject?project=${encodeURIComponent(project)}&colors=true`
-      );
+    const result = await executeWithWorkerFallback<string>(
+      `/api/context/inject?projects=${encodeURIComponent(projectsParam)}${colorsParam}${platformSourceParam}`,
+      'GET',
+    );
 
-      if (!response.ok) {
-        // Don't throw - context fetch failure should not block the user's prompt
-        return { exitCode: HOOK_EXIT_CODES.SUCCESS };
-      }
-
-      const output = await response.text();
-
-      // Write to stderr for user visibility
-      // Note: Using process.stderr.write instead of console.error to avoid
-      // Claude Code treating this as a hook error. The actual hook output
-      // goes to stdout via hook-command.ts JSON serialization.
-      process.stderr.write(
-        "\n\n" + String.fromCodePoint(0x1F4DD) + " Claude-Mem Context Loaded\n\n" +
-        output +
-        "\n\n" + String.fromCodePoint(0x1F4A1) + " Wrap any message with <private> ... </private> to prevent storing sensitive information.\n" +
-        "\n" + String.fromCodePoint(0x1F4AC) + " Community https://discord.gg/J4wttp9vDu" +
-        `\n` + String.fromCodePoint(0x1F4FA) + ` Watch live in browser http://localhost:${port}/\n`
-      );
-    } catch (error) {
-      // Worker unreachable — skip user message gracefully
-      // User message context error is non-critical — skip gracefully
+    if (isWorkerFallback(result)) {
+      return { exitCode: HOOK_EXIT_CODES.SUCCESS };
     }
 
-    return { exitCode: HOOK_EXIT_CODES.SUCCESS };
-  }
+    const output = typeof result === 'string' ? result : '';
+    // IO discipline: the banner is a USER_HINT. Return it via systemMessage so
+    // the platform adapter routes it (claude-code surfaces it inline, exactly
+    // like the old stderr write, but inside the HookResult contract). This
+    // handler MUST stay pure — no process.stderr.write / console.* / process.exit.
+    const bannerText =
+      "\n\n" + String.fromCodePoint(0x1F4DD) + " Claude-Mem Context Loaded\n\n" +
+      output +
+      "\n\n" + String.fromCodePoint(0x1F4A1) + " Wrap any message with <private> ... </private> to prevent storing sensitive information.\n" +
+      "\n" + String.fromCodePoint(0x1F4AC) + " Community https://discord.gg/J4wttp9vDu" +
+      `\n` + String.fromCodePoint(0x1F4FA) + ` Watch live in browser ${getViewerBaseUrl(port)}/\n` +
+      proTrialLine('context-banner') + `\n`;
+
+    return { exitCode: HOOK_EXIT_CODES.SUCCESS, systemMessage: bannerText };
+  },
 };

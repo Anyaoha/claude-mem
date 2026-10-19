@@ -1,137 +1,418 @@
-/**
- * Session Routes
- *
- * Handles session lifecycle operations: initialization, observations, summarization, completion.
- * These routes manage the flow of work through the Claude Agent SDK.
- */
 
 import express, { Request, Response } from 'express';
-import { getWorkerPort } from '../../../../shared/worker-utils.js';
+import { z } from 'zod';
+import { ingestObservation, ingestSummarize, ingestSessionEnd, type IngestContext } from '../shared.js';
+import { validateBody } from '../middleware/validateBody.js';
+import { requireLocalhost } from '../middleware.js';
 import { logger } from '../../../../utils/logger.js';
-import { stripMemoryTagsFromJson, stripMemoryTagsFromPrompt } from '../../../../utils/tag-stripping.js';
+import { stripMemoryTags, isCodexInternalPrompt, isInternalProtocolPayload } from '../../../../utils/tag-stripping.js';
 import { SessionManager } from '../../SessionManager.js';
 import { DatabaseManager } from '../../DatabaseManager.js';
-import { SDKAgent } from '../../SDKAgent.js';
-import { GeminiAgent, isGeminiSelected, isGeminiAvailable } from '../../GeminiAgent.js';
-import { OpenRouterAgent, isOpenRouterSelected, isOpenRouterAvailable } from '../../OpenRouterAgent.js';
+import { ClaudeProvider } from '../../ClaudeProvider.js';
+import { GeminiProvider } from '../../GeminiProvider.js';
+import { OpenRouterProvider } from '../../OpenRouterProvider.js';
+import { OpenAICompatProvider } from '../../OpenAICompatProvider.js';
+import type { CodexProvider } from '../../CodexProvider.js';
+import { getSelectedProvider, recordCmemFallbackIfEligible, releaseCmemGatewayProbe, selectProviderForGenerator, type SelectableProvider } from '../../provider-dispatch.js';
 import type { WorkerService } from '../../../worker-service.js';
 import { BaseRouteHandler } from '../BaseRouteHandler.js';
 import { SessionEventBroadcaster } from '../../events/SessionEventBroadcaster.js';
-import { SessionCompletionHandler } from '../../session/SessionCompletionHandler.js';
 import { PrivacyCheckValidator } from '../../validation/PrivacyCheckValidator.js';
+import { MEDIA_PROMPT_PLACEHOLDER } from '../../../sqlite/prompt-storage.js';
 import { SettingsDefaultsManager } from '../../../../shared/SettingsDefaultsManager.js';
-import { USER_SETTINGS_PATH } from '../../../../shared/paths.js';
-import { getProcessBySession, ensureProcessExit } from '../../ProcessRegistry.js';
+import { USER_SETTINGS_PATH, ensureObserverSessionsDir } from '../../../../shared/paths.js';
+import { getProjectContext, isProjectKeySource } from '../../../../utils/project-name.js';
+import { isProjectExcluded } from '../../../../utils/project-filter.js';
+import { startGeneratorWithProvider } from '../../session/GeneratorRunner.js';
+import { captureEvent } from '../../../telemetry/telemetry.js';
+import { recordWorkStatePrompt, recordWorkStatePrivacy } from '../../../telemetry/work-state.js';
+import { firstPartySkillFromSlashPrompt } from '../../../telemetry/skill-id.js';
+import { SessionCompletionHandler } from '../../session/SessionCompletionHandler.js';
+import { USER_PROMPT_DEDUPE_WINDOW_MS } from '../../../../shared/user-prompts.js';
+import {
+  CLAUDE_CLI_SETUP_RECHECK_COOLDOWN_MS,
+  CODEX_CLI_SETUP_RECHECK_COOLDOWN_MS,
+  clearDependencyStatus,
+  getDependencyStatus,
+  isDependencyStatusInCooldown,
+  recordClaudeCliSetupRequired,
+} from '../../../../shared/dependency-health.js';
+import { executableFingerprint } from '../../../../shared/executable-fingerprint.js';
+import { findClaudeExecutable, isClaudeExecutableUnspawnable } from '../../../../shared/find-claude-executable.js';
+import {
+  tryAdmitQuotaProbe,
+  releaseQuotaProbe,
+  getQuotaCooldown,
+  isQuotaCooldownActive,
+  cooldownAppliesToCurrentAccount,
+  resolveQuotaCooldownMs,
+} from '../../../../shared/quota-cooldown.js';
+import { isClassified, type ClassifiedProviderError } from '../../provider-errors.js';
+import { classifyClaudeError } from '../../ClaudeProvider.js';
+import { isSessionParkedForSlot } from '../../../../supervisor/process-registry.js';
+import {
+  canAttemptClaudeCliSelfHeal,
+  recordClaudeCliSelfHealAttempt,
+  clearClaudeCliSelfHealAttempts,
+  claudeCliSelfHealAttemptsInWindow,
+  SELF_HEAL_MAX_ATTEMPTS,
+} from '../../stale-spawn-recovery.js';
+import type { TelegramWrapupFormatterInput } from '../../../integrations/TelegramWrapupNotifier.js';
+
+const MAX_USER_PROMPT_BYTES = 256 * 1024;
 
 export class SessionRoutes extends BaseRouteHandler {
-  private completionHandler: SessionCompletionHandler;
-  private spawnInProgress = new Map<number, boolean>();
-  private crashRecoveryScheduled = new Set<number>();
+  // #2756 round 3: ensureGeneratorRunning is called from independent HTTP
+  // request handlers (observation ingest, /summarize, /init — see
+  // shared.ts:138 and this file's own callers below), so two calls for the
+  // SAME sessionDbId can genuinely run concurrently. Both branches of the
+  // method below have an async gap — an `await` between reading
+  // `session.generatorPromise`/`session.currentProvider` and the eventual
+  // `startGeneratorWithProvider` call that reassigns them — during which a
+  // second concurrent call sees stale state and starts its own generator,
+  // producing two live generators for one session. This map serializes
+  // ensureGeneratorRunning calls per sessionDbId (a promise-chained mutex) so
+  // only one call's body runs at a time; calls for different sessionDbIds
+  // remain fully concurrent. See ensureGeneratorRunningLocked for the actual
+  // logic this now gates.
+  private ensureGeneratorLocks = new Map<number, Promise<void>>();
 
   constructor(
     private sessionManager: SessionManager,
     private dbManager: DatabaseManager,
-    private sdkAgent: SDKAgent,
-    private geminiAgent: GeminiAgent,
-    private openRouterAgent: OpenRouterAgent,
+    private sdkAgent: ClaudeProvider,
+    private geminiAgent: GeminiProvider,
+    private openRouterAgent: OpenRouterProvider,
     private eventBroadcaster: SessionEventBroadcaster,
-    private workerService: WorkerService
+    private workerService: WorkerService,
+    private completionHandler: SessionCompletionHandler,
+    private codexAgent?: CodexProvider,
+    // After codexAgent, so every existing positional caller keeps its argument order.
+    private openAICompatAgent?: OpenAICompatProvider,
   ) {
     super();
-    this.completionHandler = new SessionCompletionHandler(
-      sessionManager,
-      eventBroadcaster
-    );
+    this.sessionManager.setTelegramWrapupFormatter?.(this.formatTelegramWrapup);
   }
 
   /**
-   * Get the appropriate agent based on settings
-   * Throws error if provider is selected but not configured (no silent fallback)
-   *
-   * Note: Session linking via contentSessionId allows provider switching mid-session.
-   * The conversationHistory on ActiveSession maintains context across providers.
+   * A worker process self-heals the stale-Claude-spawn wedge at most once: the
+   * restart replaces this process, so concurrent sessions hitting the same wedge
+   * must not each burn a slot in the per-generation persistent budget.
    */
-  private getActiveAgent(): SDKAgent | GeminiAgent | OpenRouterAgent {
-    if (isOpenRouterSelected()) {
-      if (isOpenRouterAvailable()) {
-        logger.debug('SESSION', 'Using OpenRouter agent');
-        return this.openRouterAgent;
-      } else {
-        throw new Error('OpenRouter provider selected but no API key configured. Set CLAUDE_MEM_OPENROUTER_API_KEY in settings or OPENROUTER_API_KEY environment variable.');
+  private claudeSelfHealTriggered = false;
+
+  /**
+   * When the Claude CLI is present on disk but this worker process can no longer
+   * spawn it (ENOENT after a CLI auto-update swapped the binary underneath a
+   * long-running process), an in-process re-probe can never recover — only a
+   * fresh process can. Self-restart the worker via the successor-handoff path,
+   * bounded by a cross-process-persistent budget so a genuinely broken install
+   * cannot thrash. Returns true when a restart was triggered.
+   */
+  private maybeSelfHealStaleClaudeSpawn(error: unknown, source: string, sessionDbId: number): boolean {
+    const cause = isClassified(error) ? (error as ClassifiedProviderError).cause : undefined;
+    const unspawnable = isClaudeExecutableUnspawnable(error) || isClaudeExecutableUnspawnable(cause);
+    if (!unspawnable) return false;
+
+    // Restart already scheduled by an earlier session in this process — the
+    // successor will re-resolve the CLI; do not record another attempt.
+    if (this.claudeSelfHealTriggered) return true;
+
+    if (!canAttemptClaudeCliSelfHeal()) {
+      logger.warn('SESSION', 'Claude CLI present but unspawnable; self-heal restart budget exhausted — leaving in setup_required (restart claude-mem manually / verify the CLI)', {
+        sessionId: sessionDbId,
+        source,
+        attemptsInWindow: claudeCliSelfHealAttemptsInWindow(),
+        maxAttempts: SELF_HEAL_MAX_ATTEMPTS,
+      });
+      return false;
+    }
+
+    const attempt = recordClaudeCliSelfHealAttempt();
+    logger.warn('SESSION', 'Claude CLI present on disk but unspawnable from this worker (stale process after CLI auto-update) — self-restarting to recover', {
+      sessionId: sessionDbId,
+      source,
+      selfHealAttempt: attempt,
+      maxAttempts: SELF_HEAL_MAX_ATTEMPTS,
+    });
+    this.claudeSelfHealTriggered = true;
+    void this.workerService.shutdown('restart');
+    return true;
+  }
+
+  private formatTelegramWrapup = async (input: TelegramWrapupFormatterInput): Promise<string> => {
+    const activeSession = this.sessionManager.getSession(input.sessionDbId);
+    const selection = activeSession?.currentProvider
+      ? { provider: activeSession.currentProvider, gatewayProbeClaimId: null }
+      : selectProviderForGenerator();
+    const activeModelId = activeSession?.currentProvider ? activeSession.lastModelId : undefined;
+
+    try {
+      switch (selection.provider) {
+        case 'codex':
+          if (!this.codexAgent) throw new Error('Codex provider is not available');
+          return await this.codexAgent.formatTelegramWrapup(
+            input, activeModelId === 'codex-default' ? undefined : activeModelId,
+          );
+        case 'gemini':
+          return await this.geminiAgent.formatTelegramWrapup(input, activeModelId);
+        case 'openrouter':
+          return await this.openRouterAgent.formatTelegramWrapup(input, activeModelId);
+        case 'openai-compatible':
+          if (!this.openAICompatAgent) throw new Error('OpenAI-compatible provider is not available');
+          return await this.openAICompatAgent.formatTelegramWrapup(input, activeModelId);
+        default:
+          return await this.sdkAgent.formatTelegramWrapup(input, activeModelId);
+      }
+    } catch (error) {
+      // A wrap-up is a gateway request like any other: a terminal rejection
+      // records the fallback, and when this wrap-up holds the post-window
+      // re-probe claim, its failure keeps memory on Claude.
+      if (selection.provider === 'openrouter') {
+        recordCmemFallbackIfEligible(error, selection.gatewayProbeClaimId);
+      }
+      throw error;
+    } finally {
+      releaseCmemGatewayProbe(selection.gatewayProbeClaimId);
+    }
+  };
+
+  /** Schedule retries through the normal provider gates and per-session mutex.
+   * The count is attempts scheduled, not generators admitted by those gates.
+   *
+   * The automatic sweep is paced by the provider's quota breaker (read-only):
+   * nothing is scheduled while the breaker withholds requests, since every
+   * attempt would only log a skip (#4127 counted 159 of those). Once the window
+   * elapses, one session per tick goes through to carry the recovery probe; the
+   * rest follow after that probe succeeds and clears the breaker. A breaker
+   * armed under another Claude account paces nothing: admission would drop it
+   * and admit, so holding this account's backlog behind it only delays it.
+   * The operator retry (`POST /api/processing`) is not paced.
+   */
+  public resumePendingSessions(source: string, includeOperatorOnly: boolean = false): number {
+    let sessionIds = this.sessionManager.getResumableSessionIds(includeOperatorOnly);
+    if (!includeOperatorOnly && sessionIds.length > 0) {
+      const provider = getSelectedProvider();
+      const cooldown = getQuotaCooldown(provider);
+      if (cooldown && cooldownAppliesToCurrentAccount(cooldown)) {
+        if (isQuotaCooldownActive(provider)) return 0;
+        sessionIds = sessionIds.slice(0, 1);
       }
     }
-    if (isGeminiSelected()) {
-      if (isGeminiAvailable()) {
-        logger.debug('SESSION', 'Using Gemini agent');
-        return this.geminiAgent;
-      } else {
-        throw new Error('Gemini provider selected but no API key configured. Set CLAUDE_MEM_GEMINI_API_KEY in settings or GEMINI_API_KEY environment variable.');
+    for (const sessionDbId of sessionIds) {
+      void this.ensureGeneratorRunning(sessionDbId, source).catch((error: unknown) => {
+        logger.warn('SESSION', 'Failed to resume buffered session', { sessionId: sessionDbId, source },
+          error instanceof Error ? error : new Error(String(error)));
+      });
+    }
+    return sessionIds.length;
+  }
+
+  public ensureGeneratorRunning(sessionDbId: number, source: string): Promise<void> {
+    const priorTail = this.ensureGeneratorLocks.get(sessionDbId) ?? Promise.resolve();
+    // .catch(() => {}) on the PRIOR tail only: one call's rejection must
+    // never jam the queue for the next call on this session. `tail` itself
+    // is left un-caught here so its own rejection still propagates to ITS
+    // caller (the caller of ensureGeneratorRunning gets back `tail`).
+    const tail: Promise<void> = priorTail
+      .catch(() => {})
+      .then(() => this.ensureGeneratorRunningLocked(sessionDbId, source));
+
+    this.ensureGeneratorLocks.set(sessionDbId, tail);
+
+    // Drop the map entry once this call is the last one queued, so the map
+    // doesn't grow forever for sessions that stop calling in. Identity
+    // check against `tail` itself: if a later call has already replaced
+    // this entry with its own tail, leave that one in place. The `.catch`
+    // here is only to stop bun/node from reporting an unhandled rejection
+    // on this cleanup-only branch — it does not affect the `tail` promise
+    // returned below, which callers still see reject normally.
+    tail.catch(() => {}).finally(() => {
+      if (this.ensureGeneratorLocks.get(sessionDbId) === tail) {
+        this.ensureGeneratorLocks.delete(sessionDbId);
       }
-    }
-    return this.sdkAgent;
+    });
+
+    return tail;
   }
 
-  /**
-   * Get the currently selected provider name
-   */
-  private getSelectedProvider(): 'claude' | 'gemini' | 'openrouter' {
-    if (isOpenRouterSelected() && isOpenRouterAvailable()) {
-      return 'openrouter';
-    }
-    return (isGeminiSelected() && isGeminiAvailable()) ? 'gemini' : 'claude';
-  }
-
-  /**
-   * Ensures agent generator is running for a session
-   * Auto-starts if not already running to process pending queue
-   * Uses either Claude SDK or Gemini based on settings
-   *
-   * Provider switching: If provider setting changed while generator is running,
-   * we let the current generator finish naturally (max 5s linger timeout).
-   * The next generator will use the new provider with shared conversationHistory.
-   */
-  private static readonly STALE_GENERATOR_THRESHOLD_MS = 30_000; // 30 seconds (#1099)
-
-  private ensureGeneratorRunning(sessionDbId: number, source: string): void {
+  private async ensureGeneratorRunningLocked(sessionDbId: number, source: string): Promise<void> {
     const session = this.sessionManager.getSession(sessionDbId);
     if (!session) return;
 
-    // GUARD: Prevent duplicate spawns
-    if (this.spawnInProgress.get(sessionDbId)) {
-      logger.debug('SESSION', 'Spawn already in progress, skipping', { sessionDbId, source });
+    // Nothing is buffered, so a generator would only open with its INIT turn
+    // and idle out: one paid request per user prompt, including prompts that
+    // never use a tool (#3454). Gated BEFORE provider selection, so this path
+    // never takes the single cmem-gateway re-probe (or a quota probe) that it
+    // would then have to release. The first observation or summarize enqueues
+    // work and starts the generator, INIT turn included, through this same
+    // method. Resume sources (overflow-recycle, response-stall, rate-limit,
+    // cmem-fallback, the periodic sweep) pass the same gate: with nothing
+    // buffered there is nothing to resume.
+    if (this.sessionManager.getMessageBuffer().getPendingCount(sessionDbId) === 0) {
+      logger.debug('SESSION', 'Skipping generator start with an empty queue', { sessionId: sessionDbId, source });
       return;
     }
 
-    const selectedProvider = this.getSelectedProvider();
+    // The claiming variant: this path is about to SEND, so it must take the
+    // single gateway re-probe rather than merely reading the clock.
+    const selection = selectProviderForGenerator();
+    const selectedProvider = selection.provider;
 
-    // Start generator if not running
     if (!session.generatorPromise) {
-      this.spawnInProgress.set(sessionDbId, true);
-      this.startGeneratorWithProvider(session, selectedProvider, source);
+      // Overflow breaker (#3800). Recycling twice without producing a
+      // conversation that fits means a restart can only abort on the same
+      // budget check — one spawn and one abort per captured tool call. Withhold
+      // restarts for a cooldown, then let one through to re-probe.
+      if (session.overflowPausedUntilMs && Date.now() < session.overflowPausedUntilMs) {
+        logger.warn('SESSION', 'Skipping generator start while the observer overflow cooldown is active', {
+          sessionId: sessionDbId,
+          source,
+          retryInMs: session.overflowPausedUntilMs - Date.now(),
+        });
+        releaseCmemGatewayProbe(selection.gatewayProbeClaimId);
+        return;
+      }
+      if (session.overflowPausedUntilMs) {
+        // Cooldown elapsed: clear the gate and the recycle debt so the probe
+        // starts from a clean slate rather than tripping the exhausted branch
+        // on its first budget check.
+        session.overflowPausedUntilMs = undefined;
+        session.consecutiveContextOverflows = 0;
+      }
+
+      if (selectedProvider === 'claude') {
+        const claudeStatus = getDependencyStatus('claude_cli');
+        if (claudeStatus?.kind === 'setup_required') {
+          if (isDependencyStatusInCooldown(claudeStatus, CLAUDE_CLI_SETUP_RECHECK_COOLDOWN_MS)) {
+            logger.warn('SESSION', 'Skipping Claude generator start until setup is repaired', {
+              sessionId: sessionDbId,
+              source,
+              dependency: claudeStatus.dependency,
+              status: claudeStatus.kind,
+              message: claudeStatus.message,
+            });
+            releaseCmemGatewayProbe(selection.gatewayProbeClaimId);
+            return;
+          }
+
+          try {
+            const resolvedPath = findClaudeExecutable('SDK');
+            // A spawn failure recorded the executable it could not launch (a
+            // .cmd/.bat shim passes discovery but not the SDK's spawn). While
+            // discovery still resolves that same, unchanged file, a start would
+            // fail the same way: keep skipping. A repair in place (reinstalling
+            // over the same path) changes the fingerprint and gets one start.
+            if (claudeStatus.executablePath === resolvedPath
+              && claudeStatus.executableFingerprint === executableFingerprint(resolvedPath)) {
+              recordClaudeCliSetupRequired(claudeStatus.message, resolvedPath);
+              logger.warn('SESSION', 'Claude executable still cannot be launched; skipping until it changes', {
+                sessionId: sessionDbId,
+                source,
+                executablePath: resolvedPath,
+              });
+              releaseCmemGatewayProbe(selection.gatewayProbeClaimId);
+              return;
+            }
+            clearDependencyStatus('claude_cli');
+            clearClaudeCliSelfHealAttempts();
+            logger.info('SESSION', 'Claude setup dependency repaired; resuming generator start', {
+              sessionId: sessionDbId,
+              source,
+            });
+          } catch (error) {
+            if (this.maybeSelfHealStaleClaudeSpawn(error, source, sessionDbId)) {
+              // The self-heal restart can be delayed or fail to hand off, and a
+              // second session hitting the already-triggered flag returns here
+              // while the first restart is still pending — in any of those
+              // windows this worker keeps running. No generator is started to
+              // carry the claim, so release it now like every other early
+              // return in this block; otherwise the gateway probe stays
+              // in-flight and suppresses later gateway checks in a worker that
+              // survived its own restart trigger.
+              releaseCmemGatewayProbe(selection.gatewayProbeClaimId);
+              return;
+            }
+            const err = error instanceof Error ? error : new Error(String(error));
+            const classified = classifyClaudeError(error);
+            if (classified.kind === 'setup_required') {
+              recordClaudeCliSetupRequired(classified.message);
+            }
+            logger.warn('SESSION', 'Claude setup dependency still unavailable after cooldown', {
+              sessionId: sessionDbId,
+              source,
+              error: classified.message,
+            }, err);
+            releaseCmemGatewayProbe(selection.gatewayProbeClaimId);
+            return;
+          }
+        }
+
+        // An unusable observer working directory has its own recheck (#4117):
+        // until the directory can be created, a start only repeats the slot
+        // wait, the keychain read and the same failure. Creating it is the
+        // whole probe.
+        if (getDependencyStatus('observer_dir')) {
+          try {
+            ensureObserverSessionsDir();
+          } catch (error) {
+            logger.warn('SESSION', 'Skipping Claude generator start until the observer working directory is usable', {
+              sessionId: sessionDbId,
+              source,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            releaseCmemGatewayProbe(selection.gatewayProbeClaimId);
+            return;
+          }
+          clearDependencyStatus('observer_dir');
+          logger.info('SESSION', 'Observer working directory repaired; resuming generator start', {
+            sessionId: sessionDbId,
+            source,
+          });
+        }
+      }
+      await this.admitAndStartGenerator(
+        session, sessionDbId, selectedProvider, source, selection.gatewayProbeClaimId, null, selection.fallbackFrom ?? null,
+      );
       return;
     }
 
-    // Generator is running - check if stale (no activity for 30s) to prevent queue stall (#1099)
-    const timeSinceActivity = Date.now() - session.lastGeneratorActivity;
-    if (timeSinceActivity > SessionRoutes.STALE_GENERATOR_THRESHOLD_MS) {
-      logger.warn('SESSION', 'Stale generator detected, aborting to prevent queue stall (#1099)', {
+    // #2756: a generator that never acquired its concurrency slot (still
+    // parked in waitForSlot) can wait indefinitely — it never idles-out,
+    // because the idle monitor only runs once the generator loop is
+    // consuming messages. Abort the parked wait and restart with the new
+    // provider immediately instead of leaving it stuck. A generator that HAS
+    // acquired its slot (mid-response) is left alone — falls through to the
+    // log-only "switch after it finishes" path below, unchanged.
+    if (session.currentProvider && session.currentProvider !== selectedProvider && isSessionParkedForSlot(sessionDbId)) {
+      // Defensive re-guard: `session` is already narrowed non-null by the
+      // early return above, but this branch spans a 3-operand `&&` plus a
+      // trailing function call before any property access — re-asserting
+      // the guard here costs nothing and removes any dependency on TS
+      // control-flow narrowing surviving that shape across the awaits below.
+      if (!session) return;
+      logger.info('SESSION', 'Provider changed while generator parked waiting for a slot; aborting the wait to switch now', {
         sessionId: sessionDbId,
-        timeSinceActivityMs: timeSinceActivity,
-        thresholdMs: SessionRoutes.STALE_GENERATOR_THRESHOLD_MS,
-        source
+        currentProvider: session.currentProvider,
+        selectedProvider,
+        historyLength: session.conversationHistory.length
       });
-      // Abort the stale generator and reset state
+
+      const oldGeneratorPromise = session.generatorPromise;
+      session.abortReason = 'provider_switch';
       session.abortController.abort();
-      session.generatorPromise = null;
-      session.abortController = new AbortController();
-      session.lastGeneratorActivity = Date.now();
-      // Start a fresh generator
-      this.spawnInProgress.set(sessionDbId, true);
-      this.startGeneratorWithProvider(session, selectedProvider, 'stale-recovery');
+
+      await this.admitAndStartGenerator(
+        session, sessionDbId, selectedProvider, source, selection.gatewayProbeClaimId, oldGeneratorPromise,
+        selection.fallbackFrom ?? null,
+      );
       return;
     }
 
-    // Generator is running - check if provider changed
+    // A generator is already running, so this call never sends and must not
+    // keep the gateway re-probe it claimed on the way in.
+    releaseCmemGatewayProbe(selection.gatewayProbeClaimId);
+
     if (session.currentProvider && session.currentProvider !== selectedProvider) {
       logger.info('SESSION', `Provider changed, will switch after current generator finishes`, {
         sessionId: sessionDbId,
@@ -139,596 +420,431 @@ export class SessionRoutes extends BaseRouteHandler {
         selectedProvider,
         historyLength: session.conversationHistory.length
       });
-      // Let current generator finish naturally, next one will use new provider
-      // The shared conversationHistory ensures context is preserved
+      // Let current generator finish naturally, next one will use new provider.
+      // The buffered queue carries over; the next generator opens a new
+      // generation seeded from this session's memory (#3800, #3479).
     }
   }
 
   /**
-   * Start a generator with the specified provider
+   * Claim the quota probe (if the breaker permits it) and start a generator
+   * for `selectedProvider`. Shared by the fresh-start path above and the
+   * #2756 parked-generator provider-switch path (which is itself a fresh
+   * start for the newly-selected provider, just triggered from the
+   * "already running" branch instead of "no generator yet").
    */
+  private async admitAndStartGenerator(
+    session: NonNullable<ReturnType<typeof this.sessionManager.getSession>>,
+    sessionDbId: number,
+    selectedProvider: SelectableProvider,
+    source: string,
+    gatewayProbeClaimId: number | null,
+    /** The parked generator a provider switch is replacing, if any. */
+    previousGenerator: Promise<void> | null = null,
+    /** The provider this run stands in for when dispatch took the quota fallback, else null. */
+    fallbackFrom: SelectableProvider | null = null,
+  ): Promise<void> {
+    let quotaProbeClaimId: number | null = null;
+    try {
+      // Must fully await the OLD generator's .catch().finally() chain (which
+      // runs handleGeneratorExit) before starting a new one: handleGeneratorExit
+      // nulls session.generatorPromise/currentProvider unconditionally with no
+      // identity check, so racing this would let the old generator's async
+      // cleanup stomp the freshly-started generator's state.
+      if (previousGenerator) {
+        await previousGenerator;
+      }
+
+      // A missing Codex CLI or ChatGPT login (codex_cli) has its own recheck,
+      // like the Claude CLI's: until it is repaired, a start only fails the same
+      // way. Once the window elapses, the start is the probe: if setup is still
+      // broken its first request records the status again, and every request
+      // queued behind it is withheld (CodexProvider's beforeSend).
+      if (selectedProvider === 'codex') {
+        const codexStatus = getDependencyStatus('codex_cli');
+        if (codexStatus && isDependencyStatusInCooldown(codexStatus, CODEX_CLI_SETUP_RECHECK_COOLDOWN_MS)) {
+          releaseCmemGatewayProbe(gatewayProbeClaimId);
+          logger.warn('SESSION', 'Skipping Codex generator start until setup is repaired', {
+            sessionId: sessionDbId,
+            source,
+            message: codexStatus.message,
+          });
+          return;
+        }
+        if (codexStatus) clearDependencyStatus('codex_cli');
+      }
+
+      // Quota breaker (#3634). Without this, an exhausted allowance produced one
+      // doomed request per captured tool call for the rest of the billing cycle:
+      // the generator exits on the refusal, and the next observation starts a
+      // fresh one that earns the same refusal. Withhold requests for a cooldown,
+      // then let exactly one through to re-probe.
+      // Claim the probe rather than merely reading the clock: every live session
+      // sees the window elapse at the same instant, so a bare check would let
+      // them all through together.
+      const admission = tryAdmitQuotaProbe(selectedProvider);
+      if (!admission.admitted) {
+        // This run is not starting, so it must not hold the gateway re-probe.
+        releaseCmemGatewayProbe(gatewayProbeClaimId);
+        const cooldown = getQuotaCooldown(selectedProvider);
+        logger.warn('SESSION', 'Skipping generator start while the provider cooldown is active', {
+          sessionId: sessionDbId,
+          source,
+          provider: selectedProvider,
+          ...(cooldown?.cause ? { cause: cooldown.cause } : {}),
+          ...(cooldown?.window ? { window: cooldown.window } : {}),
+          probeInFlight: cooldown?.probeInFlightSinceMs !== null,
+          // Asked of the window for the same reason the breaker is: a throttle
+          // resolves in ninety seconds, and reporting the quota cooldown here
+          // would log a half-hour wait that nobody is actually serving.
+          retryInMs: cooldown
+            ? Math.max(0, resolveQuotaCooldownMs(cooldown.window) - (Date.now() - cooldown.armedAtMs))
+            : 0,
+        });
+        return;
+      }
+      quotaProbeClaimId = admission.claimId;
+
+      await this.applyTierRouting(session);
+      // Tier routing yields before the generator is installed. Deletion can
+      // remove the session in that gap; do not restart its aborted controller or
+      // retain either probe claim for an orphaned generator.
+      if (this.sessionManager.getSession(sessionDbId) !== session
+        || this.sessionManager.isSessionDeleting?.(sessionDbId)
+        || session.abortReason === 'shutdown') {
+        releaseQuotaProbe(selectedProvider, quotaProbeClaimId);
+        releaseCmemGatewayProbe(gatewayProbeClaimId);
+        return;
+      }
+      this.applyQuotaFallbackModel(session, selectedProvider, fallbackFrom);
+      session.fallbackFrom = fallbackFrom;
+      // The claim travels with the run that took it: only that run may release
+      // it, or an earlier generator's exit would clear a later session's probe.
+      await this.startGeneratorWithProvider(
+        session, selectedProvider, source, quotaProbeClaimId, gatewayProbeClaimId,
+      );
+    } catch (error) {
+      // Neither claim may outlive a run that never started, or it wedges its
+      // probe shut until it goes stale. A generator that did start releases
+      // its own on exit; releasing again is a no-op, scoped to the claim id.
+      releaseQuotaProbe(selectedProvider, quotaProbeClaimId);
+      releaseCmemGatewayProbe(gatewayProbeClaimId);
+      throw error;
+    }
+  }
+
   private startGeneratorWithProvider(
     session: ReturnType<typeof this.sessionManager.getSession>,
-    provider: 'claude' | 'gemini' | 'openrouter',
-    source: string
-  ): void {
-    if (!session) return;
-
-    // Reset AbortController if it was previously aborted
-    // This fixes the bug where a session gets stuck in an infinite "Generator aborted" loop
-    // after its AbortController was aborted (e.g., from a previous generator exit)
-    if (session.abortController.signal.aborted) {
-      logger.debug('SESSION', 'Resetting aborted AbortController before starting generator', {
-        sessionId: session.sessionDbId
-      });
-      session.abortController = new AbortController();
-    }
-
-    const agent = provider === 'openrouter' ? this.openRouterAgent : (provider === 'gemini' ? this.geminiAgent : this.sdkAgent);
-    const agentName = provider === 'openrouter' ? 'OpenRouter' : (provider === 'gemini' ? 'Gemini' : 'Claude SDK');
-
-    // Use database count for accurate telemetry (in-memory array is always empty due to FK constraint fix)
-    const pendingStore = this.sessionManager.getPendingMessageStore();
-    const actualQueueDepth = pendingStore.getPendingCount(session.sessionDbId);
-
-    logger.info('SESSION', `Generator auto-starting (${source}) using ${agentName}`, {
-      sessionId: session.sessionDbId,
-      queueDepth: actualQueueDepth,
-      historyLength: session.conversationHistory.length
+    provider: SelectableProvider,
+    source: string,
+    /** The quota probe this run claimed, or null when it was admitted without one. */
+    quotaProbeClaimId: number | null,
+    /** The cmem-gateway re-probe this run claimed, or null when it took none. */
+    gatewayProbeClaimId: number | null = null,
+  ): Promise<void> {
+    return startGeneratorWithProvider(session, provider, source, quotaProbeClaimId, gatewayProbeClaimId, {
+      sessionManager: this.sessionManager,
+      sdkAgent: this.sdkAgent,
+      geminiAgent: this.geminiAgent,
+      openRouterAgent: this.openRouterAgent,
+      codexAgent: this.codexAgent,
+      openAICompatAgent: this.openAICompatAgent,
+      workerService: this.workerService,
+      completionHandler: this.completionHandler,
+      ensureGeneratorRunning: (id, trigger) => this.ensureGeneratorRunning(id, trigger),
+      maybeSelfHealStaleClaudeSpawn: (error, trigger, id) => this.maybeSelfHealStaleClaudeSpawn(error, trigger, id),
     });
-
-    // Track which provider is running and mark activity for stale detection (#1099)
-    session.currentProvider = provider;
-    session.lastGeneratorActivity = Date.now();
-
-    session.generatorPromise = agent.startSession(session, this.workerService)
-      .catch(error => {
-        // Only log non-abort errors
-        if (session.abortController.signal.aborted) return;
-        
-        logger.error('SESSION', `Generator failed`, {
-          sessionId: session.sessionDbId,
-          provider: provider,
-          error: error.message
-        }, error);
-
-        // Mark all processing messages as failed so they can be retried or abandoned
-        const pendingStore = this.sessionManager.getPendingMessageStore();
-        try {
-          const failedCount = pendingStore.markSessionMessagesFailed(session.sessionDbId);
-          if (failedCount > 0) {
-            logger.error('SESSION', `Marked messages as failed after generator error`, {
-              sessionId: session.sessionDbId,
-              failedCount
-            });
-          }
-        } catch (dbError) {
-          logger.error('SESSION', 'Failed to mark messages as failed', {
-            sessionId: session.sessionDbId
-          }, dbError as Error);
-        }
-      })
-      .finally(async () => {
-        // CRITICAL: Verify subprocess exit to prevent zombie accumulation (Issue #1168)
-        const tracked = getProcessBySession(session.sessionDbId);
-        if (tracked && !tracked.process.killed && tracked.process.exitCode === null) {
-          await ensureProcessExit(tracked, 5000);
-        }
-
-        const sessionDbId = session.sessionDbId;
-        this.spawnInProgress.delete(sessionDbId);
-        const wasAborted = session.abortController.signal.aborted;
-
-        if (wasAborted) {
-          logger.info('SESSION', `Generator aborted`, { sessionId: sessionDbId });
-        } else {
-          logger.error('SESSION', `Generator exited unexpectedly`, { sessionId: sessionDbId });
-        }
-
-        session.generatorPromise = null;
-        session.currentProvider = null;
-        this.workerService.broadcastProcessingStatus();
-
-        // Crash recovery: If not aborted and still has work, restart (with limit)
-        if (!wasAborted) {
-          try {
-            const pendingStore = this.sessionManager.getPendingMessageStore();
-            const pendingCount = pendingStore.getPendingCount(sessionDbId);
-
-            // CRITICAL: Limit consecutive restarts to prevent infinite loops
-            // This prevents runaway API costs when there's a persistent error (e.g., memorySessionId not captured)
-            const MAX_CONSECUTIVE_RESTARTS = 3;
-
-            if (pendingCount > 0) {
-              // GUARD: Prevent duplicate crash recovery spawns
-              if (this.crashRecoveryScheduled.has(sessionDbId)) {
-                logger.debug('SESSION', 'Crash recovery already scheduled', { sessionDbId });
-                return;
-              }
-
-              session.consecutiveRestarts = (session.consecutiveRestarts || 0) + 1;
-
-              if (session.consecutiveRestarts > MAX_CONSECUTIVE_RESTARTS) {
-                logger.error('SESSION', `CRITICAL: Generator restart limit exceeded - stopping to prevent runaway costs`, {
-                  sessionId: sessionDbId,
-                  pendingCount,
-                  consecutiveRestarts: session.consecutiveRestarts,
-                  maxRestarts: MAX_CONSECUTIVE_RESTARTS,
-                  action: 'Generator will NOT restart. Check logs for root cause. Messages remain in pending state.'
-                });
-                // Don't restart - abort to prevent further API calls
-                session.abortController.abort();
-                return;
-              }
-
-              logger.info('SESSION', `Restarting generator after crash/exit with pending work`, {
-                sessionId: sessionDbId,
-                pendingCount,
-                consecutiveRestarts: session.consecutiveRestarts,
-                maxRestarts: MAX_CONSECUTIVE_RESTARTS
-              });
-
-              // Abort OLD controller before replacing to prevent child process leaks
-              const oldController = session.abortController;
-              session.abortController = new AbortController();
-              oldController.abort();
-
-              this.crashRecoveryScheduled.add(sessionDbId);
-
-              // Exponential backoff: 1s, 2s, 4s for subsequent restarts
-              const backoffMs = Math.min(1000 * Math.pow(2, session.consecutiveRestarts - 1), 8000);
-
-              // Delay before restart with exponential backoff
-              setTimeout(() => {
-                this.crashRecoveryScheduled.delete(sessionDbId);
-                const stillExists = this.sessionManager.getSession(sessionDbId);
-                if (stillExists && !stillExists.generatorPromise) {
-                  this.startGeneratorWithProvider(stillExists, this.getSelectedProvider(), 'crash-recovery');
-                }
-              }, backoffMs);
-            } else {
-              // No pending work - abort to kill the child process
-              session.abortController.abort();
-              // Reset restart counter on successful completion
-              session.consecutiveRestarts = 0;
-              logger.debug('SESSION', 'Aborted controller after natural completion', {
-                sessionId: sessionDbId
-              });
-            }
-          } catch (e) {
-            // Ignore errors during recovery check, but still abort to prevent leaks
-            logger.debug('SESSION', 'Error during recovery check, aborting to prevent leaks', { sessionId: sessionDbId, error: e instanceof Error ? e.message : String(e) });
-            session.abortController.abort();
-          }
-        }
-        // NOTE: We do NOT delete the session here anymore.
-        // The generator waits for events, so if it exited, it's either aborted or crashed.
-        // Idle sessions stay in memory (ActiveSession is small) to listen for future events.
-      });
   }
 
   setupRoutes(app: express.Application): void {
-    // Legacy session endpoints (use sessionDbId)
-    app.post('/sessions/:sessionDbId/init', this.handleSessionInit.bind(this));
-    app.post('/sessions/:sessionDbId/observations', this.handleObservations.bind(this));
-    app.post('/sessions/:sessionDbId/summarize', this.handleSummarize.bind(this));
-    app.get('/sessions/:sessionDbId/status', this.handleSessionStatus.bind(this));
-    app.delete('/sessions/:sessionDbId', this.handleSessionDelete.bind(this));
-    app.post('/sessions/:sessionDbId/complete', this.handleSessionComplete.bind(this));
-
-    // New session endpoints (use contentSessionId)
-    app.post('/api/sessions/init', this.handleSessionInitByClaudeId.bind(this));
-    app.post('/api/sessions/observations', this.handleObservationsByClaudeId.bind(this));
-    app.post('/api/sessions/summarize', this.handleSummarizeByClaudeId.bind(this));
-    app.post('/api/sessions/complete', this.handleCompleteByClaudeId.bind(this));
+    // Operator repair route: it starts generators and retries auth/transport
+    // pauses that the automatic sweep leaves alone, so it is localhost-only
+    // like the other admin routes.
+    app.post(
+      '/api/processing',
+      requireLocalhost,
+      validateBody(SessionRoutes.processingSchema),
+      this.handleProcessing.bind(this)
+    );
+    // Read-only admission probe: older workers must not silently ignore nativePromptId.
+    app.get('/api/sessions/native-prompt-capability', (_req: Request, res: Response) => {
+      res.json({ nativePromptId: 1 });
+    });
+    app.post(
+      '/api/sessions/init',
+      validateBody(SessionRoutes.sessionInitByClaudeIdSchema),
+      this.handleSessionInitByClaudeId.bind(this)
+    );
+    app.post(
+      '/api/sessions/observations',
+      validateBody(SessionRoutes.observationsByClaudeIdSchema),
+      this.handleObservationsByClaudeId.bind(this)
+    );
+    app.post(
+      '/api/sessions/summarize',
+      validateBody(SessionRoutes.summarizeByClaudeIdSchema),
+      this.handleSummarizeByClaudeId.bind(this)
+    );
+    app.post(
+      '/api/sessions/session-end',
+      validateBody(SessionRoutes.sessionEndSchema),
+      this.handleSessionEnd.bind(this)
+    );
   }
 
-  /**
-   * Initialize a new session
-   */
-  private handleSessionInit = this.wrapHandler((req: Request, res: Response): void => {
-    const sessionDbId = this.parseIntParam(req, res, 'sessionDbId');
-    if (sessionDbId === null) return;
-
-    const { userPrompt, promptNumber } = req.body;
-    logger.info('HTTP', 'SessionRoutes: handleSessionInit called', {
-      sessionDbId,
-      promptNumber,
-      has_userPrompt: !!userPrompt
-    });
-
-    const session = this.sessionManager.initializeSession(sessionDbId, userPrompt, promptNumber);
-
-    // Get the latest user_prompt for this session to sync to Chroma
-    const latestPrompt = this.dbManager.getSessionStore().getLatestUserPrompt(session.contentSessionId);
-
-    // Broadcast new prompt to SSE clients (for web UI)
-    if (latestPrompt) {
-      this.eventBroadcaster.broadcastNewPrompt({
-        id: latestPrompt.id,
-        content_session_id: latestPrompt.content_session_id,
-        project: latestPrompt.project,
-        prompt_number: latestPrompt.prompt_number,
-        prompt_text: latestPrompt.prompt_text,
-        created_at_epoch: latestPrompt.created_at_epoch
-      });
-
-      // Sync user prompt to Chroma
-      const chromaStart = Date.now();
-      const promptText = latestPrompt.prompt_text;
-      this.dbManager.getChromaSync()?.syncUserPrompt(
-        latestPrompt.id,
-        latestPrompt.memory_session_id,
-        latestPrompt.project,
-        promptText,
-        latestPrompt.prompt_number,
-        latestPrompt.created_at_epoch
-      ).then(() => {
-        const chromaDuration = Date.now() - chromaStart;
-        const truncatedPrompt = promptText.length > 60
-          ? promptText.substring(0, 60) + '...'
-          : promptText;
-        logger.debug('CHROMA', 'User prompt synced', {
-          promptId: latestPrompt.id,
-          duration: `${chromaDuration}ms`,
-          prompt: truncatedPrompt
-        });
-      }).catch((error) => {
-        logger.error('CHROMA', 'User prompt sync failed, continuing without vector search', {
-          promptId: latestPrompt.id,
-          prompt: promptText.length > 60 ? promptText.substring(0, 60) + '...' : promptText
-        }, error);
-      });
-    }
-
-    // Idempotent: ensure generator is running (matches handleObservations / handleSummarize)
-    this.ensureGeneratorRunning(sessionDbId, 'init');
-
-    // Broadcast session started event
-    this.eventBroadcaster.broadcastSessionStarted(sessionDbId, session.project);
-
-    res.json({ status: 'initialized', sessionDbId, port: getWorkerPort() });
+  private static readonly processingSchema = z.object({
+    isProcessing: z.boolean(),
   });
 
-  /**
-   * Queue observations for processing
-   * CRITICAL: Ensures SDK agent is running to process the queue (ALWAYS SAVE EVERYTHING)
-   */
-  private handleObservations = this.wrapHandler((req: Request, res: Response): void => {
-    const sessionDbId = this.parseIntParam(req, res, 'sessionDbId');
-    if (sessionDbId === null) return;
+  private handleProcessing = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
+    // Legacy callers request false to unstick processing. There is no global
+    // processing flag to reset: retry existing buffered sessions instead.
+    const scheduledSessions = req.body.isProcessing ? 0 : this.resumePendingSessions('processing-api', true);
+    const queueDepth = this.sessionManager.getTotalQueueDepth();
+    res.json({
+      status: 'ok',
+      isProcessing: queueDepth > 0,
+      queueDepth,
+      activeSessions: this.sessionManager.getActiveSessionCount(),
+      scheduledSessions,
+    });
+  });
 
-    const { tool_name, tool_input, tool_response, prompt_number, cwd } = req.body;
+  private static readonly sessionInitByClaudeIdSchema = z.object({
+    contentSessionId: z.string().min(1),
+    project: z.string().optional(),
+    prompt: z.string().optional(),
+    // A host's real user-turn ID, scoped by platform + content session.
+    nativePromptId: z.string().min(1).max(256).regex(/^[^\s\x00-\x1f\x7f]+$/).optional(),
+    platformSource: z.string().optional(),
+    customTitle: z.string().optional(),
+    // The checkout `project` was resolved from, and how (gate P1-2).
+    cwd: z.string().optional(),
+    projectKeySource: z.string().optional(),
+  }).passthrough();
 
-    this.sessionManager.queueObservation(sessionDbId, {
+  private static readonly observationsByClaudeIdSchema = z.object({
+    contentSessionId: z.string().min(1),
+    tool_name: z.string().min(1),
+    tool_input: z.unknown().optional(),
+    tool_response: z.unknown().optional(),
+    cwd: z.string().optional(),
+    agentId: z.string().optional(),
+    agentType: z.string().optional(),
+    platformSource: z.string().optional(),
+    tool_use_id: z.string().optional(),
+    toolUseId: z.string().optional(),
+    // Receipt join keys (frozen 2026-09-06). Pure pass-through onto tool_uses;
+    // Claude-Mem never derives them and stores no cost field of its own.
+    or_generation_id: z.string().optional(),
+    orGenerationId: z.string().optional(),
+    or_session_id: z.string().optional(),
+    orSessionId: z.string().optional(),
+  }).passthrough();
+
+  private static readonly summarizeByClaudeIdSchema = z.object({
+    contentSessionId: z.string().min(1),
+    last_assistant_message: z.string().optional(),
+    agentId: z.string().optional(),
+    platformSource: z.string().optional(),
+    observedModel: z.string().min(1).max(200).optional(),
+    observedBilling: z.string().min(1).max(40).optional(),
+    // The checkout, from hosts that cannot check exclusions themselves.
+    cwd: z.string().optional(),
+  }).passthrough();
+
+  private static readonly sessionEndSchema = z.object({
+    contentSessionId: z.string().min(1),
+    platformSource: z.string().optional(),
+    reason: z.string().optional(),
+    cwd: z.string().optional(),
+  }).passthrough();
+
+  private handleObservationsByClaudeId = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
+    const {
+      contentSessionId,
       tool_name,
       tool_input,
       tool_response,
-      prompt_number,
-      cwd
-    });
+      cwd,
+      agentId,
+      agentType,
+      tool_use_id,
+      toolUseId,
+      or_generation_id,
+      orGenerationId,
+      or_session_id,
+      orSessionId,
+    } = req.body;
+    const platformSource = this.getPlatformSourceFromRequest(req);
 
-    // CRITICAL: Ensure SDK agent is running to consume the queue
-    this.ensureGeneratorRunning(sessionDbId, 'observation');
-
-    // Broadcast observation queued event
-    this.eventBroadcaster.broadcastObservationQueued(sessionDbId);
-
-    res.json({ status: 'queued' });
-  });
-
-  /**
-   * Queue summarize request
-   * CRITICAL: Ensures SDK agent is running to process the queue (ALWAYS SAVE EVERYTHING)
-   */
-  private handleSummarize = this.wrapHandler((req: Request, res: Response): void => {
-    const sessionDbId = this.parseIntParam(req, res, 'sessionDbId');
-    if (sessionDbId === null) return;
-
-    const { last_assistant_message } = req.body;
-
-    this.sessionManager.queueSummarize(sessionDbId, last_assistant_message);
-
-    // CRITICAL: Ensure SDK agent is running to consume the queue
-    this.ensureGeneratorRunning(sessionDbId, 'summarize');
-
-    // Broadcast summarize queued event
-    this.eventBroadcaster.broadcastSummarizeQueued();
-
-    res.json({ status: 'queued' });
-  });
-
-  /**
-   * Get session status
-   */
-  private handleSessionStatus = this.wrapHandler((req: Request, res: Response): void => {
-    const sessionDbId = this.parseIntParam(req, res, 'sessionDbId');
-    if (sessionDbId === null) return;
-
-    const session = this.sessionManager.getSession(sessionDbId);
-
-    if (!session) {
-      res.json({ status: 'not_found' });
-      return;
-    }
-
-    // Use database count for accurate queue length (in-memory array is always empty due to FK constraint fix)
-    const pendingStore = this.sessionManager.getPendingMessageStore();
-    const queueLength = pendingStore.getPendingCount(sessionDbId);
-
-    res.json({
-      status: 'active',
-      sessionDbId,
-      project: session.project,
-      queueLength,
-      uptime: Date.now() - session.startTime
-    });
-  });
-
-  /**
-   * Delete a session
-   */
-  private handleSessionDelete = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
-    const sessionDbId = this.parseIntParam(req, res, 'sessionDbId');
-    if (sessionDbId === null) return;
-
-    await this.completionHandler.completeByDbId(sessionDbId);
-
-    res.json({ status: 'deleted' });
-  });
-
-  /**
-   * Complete a session (backward compatibility for cleanup-hook)
-   * cleanup-hook expects POST /sessions/:sessionDbId/complete instead of DELETE
-   */
-  private handleSessionComplete = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
-    const sessionDbId = this.parseIntParam(req, res, 'sessionDbId');
-    if (sessionDbId === null) return;
-
-    await this.completionHandler.completeByDbId(sessionDbId);
-
-    res.json({ success: true });
-  });
-
-  /**
-   * Queue observations by contentSessionId (post-tool-use-hook uses this)
-   * POST /api/sessions/observations
-   * Body: { contentSessionId, tool_name, tool_input, tool_response, cwd }
-   */
-  private handleObservationsByClaudeId = this.wrapHandler((req: Request, res: Response): void => {
-    const { contentSessionId, tool_name, tool_input, tool_response, cwd } = req.body;
-
-    if (!contentSessionId) {
-      return this.badRequest(res, 'Missing contentSessionId');
-    }
-
-    // Load skip tools from settings
-    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
-    const skipTools = new Set(settings.CLAUDE_MEM_SKIP_TOOLS.split(',').map(t => t.trim()).filter(Boolean));
-
-    // Skip low-value or meta tools
-    if (skipTools.has(tool_name)) {
-      logger.debug('SESSION', 'Skipping observation for tool', { tool_name });
-      res.json({ status: 'skipped', reason: 'tool_excluded' });
-      return;
-    }
-
-    // Skip meta-observations: file operations on session-memory files
-    const fileOperationTools = new Set(['Edit', 'Write', 'Read', 'NotebookEdit']);
-    if (fileOperationTools.has(tool_name) && tool_input) {
-      const filePath = tool_input.file_path || tool_input.notebook_path;
-      if (filePath && filePath.includes('session-memory')) {
-        logger.debug('SESSION', 'Skipping meta-observation for session-memory file', {
-          tool_name,
-          file_path: filePath
-        });
-        res.json({ status: 'skipped', reason: 'session_memory_meta' });
-        return;
-      }
-    }
-
-    try {
-      const store = this.dbManager.getSessionStore();
-
-      // Get or create session
-      const sessionDbId = store.createSDKSession(contentSessionId, '', '');
-      const promptNumber = store.getPromptNumberFromUserPrompts(contentSessionId);
-
-      // Privacy check: skip if user prompt was entirely private
-      const userPrompt = PrivacyCheckValidator.checkUserPromptPrivacy(
-        store,
-        contentSessionId,
-        promptNumber,
-        'observation',
-        sessionDbId,
-        { tool_name }
-      );
-      if (!userPrompt) {
-        res.json({ status: 'skipped', reason: 'private' });
-        return;
-      }
-
-      // Strip memory tags from tool_input and tool_response
-      const cleanedToolInput = tool_input !== undefined
-        ? stripMemoryTagsFromJson(JSON.stringify(tool_input))
-        : '{}';
-
-      const cleanedToolResponse = tool_response !== undefined
-        ? stripMemoryTagsFromJson(JSON.stringify(tool_response))
-        : '{}';
-
-      // Queue observation
-      this.sessionManager.queueObservation(sessionDbId, {
-        tool_name,
-        tool_input: cleanedToolInput,
-        tool_response: cleanedToolResponse,
-        prompt_number: promptNumber,
-        cwd: cwd || (() => {
-          logger.error('SESSION', 'Missing cwd when queueing observation in SessionRoutes', {
-            sessionId: sessionDbId,
-            tool_name
-          });
-          return '';
-        })()
-      });
-
-      // Ensure SDK agent is running
-      this.ensureGeneratorRunning(sessionDbId, 'observation');
-
-      // Broadcast observation queued event
-      this.eventBroadcaster.broadcastObservationQueued(sessionDbId);
-
-      res.json({ status: 'queued' });
-    } catch (error) {
-      // Return 200 on recoverable errors so the hook doesn't break
-      logger.error('SESSION', 'Observation storage failed', { contentSessionId, tool_name }, error as Error);
-      res.json({ stored: false, reason: (error as Error).message });
-    }
-  });
-
-  /**
-   * Queue summarize by contentSessionId (summary-hook uses this)
-   * POST /api/sessions/summarize
-   * Body: { contentSessionId, last_assistant_message }
-   *
-   * Checks privacy, queues summarize request for SDK agent
-   */
-  private handleSummarizeByClaudeId = this.wrapHandler((req: Request, res: Response): void => {
-    const { contentSessionId, last_assistant_message } = req.body;
-
-    if (!contentSessionId) {
-      return this.badRequest(res, 'Missing contentSessionId');
-    }
-
-    const store = this.dbManager.getSessionStore();
-
-    // Get or create session
-    const sessionDbId = store.createSDKSession(contentSessionId, '', '');
-    const promptNumber = store.getPromptNumberFromUserPrompts(contentSessionId);
-
-    // Privacy check: skip if user prompt was entirely private
-    const userPrompt = PrivacyCheckValidator.checkUserPromptPrivacy(
-      store,
+    const result = await ingestObservation({
       contentSessionId,
-      promptNumber,
-      'summarize',
-      sessionDbId
-    );
-    if (!userPrompt) {
-      res.json({ status: 'skipped', reason: 'private' });
+      toolName: tool_name,
+      toolInput: tool_input,
+      toolResponse: tool_response,
+      cwd,
+      platformSource,
+      telemetryPlatformSource: typeof req.body.telemetryPlatformSource === 'string'
+        ? req.body.telemetryPlatformSource : SessionRoutes.rawPlatformSourceFromRequest(req) ?? 'unknown',
+      enqueuedAtEpochMs: typeof req.body.enqueuedAtEpochMs === 'number' ? req.body.enqueuedAtEpochMs : undefined,
+      telemetryToolEpochMs: typeof req.body.telemetryToolEpochMs === 'number' ? req.body.telemetryToolEpochMs : undefined,
+      agentId,
+      agentType,
+      toolUseId: typeof tool_use_id === 'string' ? tool_use_id : (typeof toolUseId === 'string' ? toolUseId : undefined),
+      orGenerationId: typeof or_generation_id === 'string' ? or_generation_id : (typeof orGenerationId === 'string' ? orGenerationId : undefined),
+      orSessionId: typeof or_session_id === 'string' ? or_session_id : (typeof orSessionId === 'string' ? orSessionId : undefined),
+    });
+
+    if (!result.ok) {
+      res.status(result.status ?? 500).json({ stored: false, reason: result.reason });
       return;
     }
 
-    // Queue summarize
-    this.sessionManager.queueSummarize(sessionDbId, last_assistant_message);
-
-    // Ensure SDK agent is running
-    this.ensureGeneratorRunning(sessionDbId, 'summarize');
-
-    // Broadcast summarize queued event
-    this.eventBroadcaster.broadcastSummarizeQueued();
+    if ('status' in result && result.status === 'skipped') {
+      res.json({ status: 'skipped', reason: result.reason });
+      return;
+    }
 
     res.json({ status: 'queued' });
   });
 
-  /**
-   * Complete session by contentSessionId (session-complete hook uses this)
-   * POST /api/sessions/complete
-   * Body: { contentSessionId }
-   *
-   * Removes session from active sessions map, allowing orphan reaper to
-   * clean up any remaining subprocesses.
-   *
-   * Fixes Issue #842: Sessions stay in map forever, reaper thinks all active.
-   */
-  private handleCompleteByClaudeId = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
+  private handleSummarizeByClaudeId = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
+    const { contentSessionId, last_assistant_message, agentId, observedModel, observedBilling, cwd } = req.body;
+    const outcome = await ingestSummarize({
+      contentSessionId,
+      platformSource: this.getPlatformSourceFromRequest(req),
+      lastAssistantMessage: last_assistant_message,
+      agentId,
+      observedModel,
+      observedBilling,
+      cwd,
+    }, this.ingestDeps());
+
+    if (outcome.status === 'unknown_session') {
+      res.json({ status: 'skipped', reason: 'unknown_session' });
+      return;
+    }
+    if (outcome.status === 'skipped') {
+      res.json({ status: 'skipped', reason: outcome.reason });
+      return;
+    }
+    res.json({ status: 'queued' });
+  });
+
+  private handleSessionEnd = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
+    const outcome = await ingestSessionEnd({
+      contentSessionId: req.body.contentSessionId,
+      platformSource: this.getPlatformSourceFromRequest(req),
+    }, this.ingestDeps());
+    res.json({ status: outcome.status });
+  });
+
+  /** The route's own collaborators, so the shared ingest behaves exactly as the inline handler did. */
+  private ingestDeps(): IngestContext {
+    return {
+      sessionManager: this.sessionManager,
+      dbManager: this.dbManager,
+      eventBroadcaster: this.eventBroadcaster,
+      ensureGeneratorRunning: (sessionDbId, source) => this.ensureGeneratorRunning(sessionDbId, source),
+    };
+  }
+
+  private handleSessionInitByClaudeId = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     const { contentSessionId } = req.body;
 
-    logger.info('HTTP', '→ POST /api/sessions/complete', { contentSessionId });
-
-    if (!contentSessionId) {
-      return this.badRequest(res, 'Missing contentSessionId');
-    }
-
-    const store = this.dbManager.getSessionStore();
-
-    // Look up sessionDbId from contentSessionId (createSDKSession is idempotent)
-    // Pass empty strings - we only need the ID lookup, not to create a new session
-    const sessionDbId = store.createSDKSession(contentSessionId, '', '');
-
-    // Check if session is in the active sessions map
-    const activeSession = this.sessionManager.getSession(sessionDbId);
-    if (!activeSession) {
-      // Session may not be in memory (already completed or never initialized)
-      logger.debug('SESSION', 'session-complete: Session not in active map', {
-        contentSessionId,
-        sessionDbId
-      });
-      res.json({ status: 'skipped', reason: 'not_active' });
-      return;
-    }
-
-    // Complete the session (removes from active sessions map)
-    await this.completionHandler.completeByDbId(sessionDbId);
-
-    logger.info('SESSION', 'Session completed via API', {
-      contentSessionId,
-      sessionDbId
-    });
-
-    res.json({ status: 'completed', sessionDbId });
-  });
-
-  /**
-   * Initialize session by contentSessionId (new-hook uses this)
-   * POST /api/sessions/init
-   * Body: { contentSessionId, project, prompt }
-   *
-   * Performs all session initialization DB operations:
-   * - Creates/gets SDK session (idempotent)
-   * - Increments prompt counter
-   * - Saves user prompt (with privacy tag stripping)
-   *
-   * Returns: { sessionDbId, promptNumber, skipped: boolean, reason?: string }
-   */
-  private handleSessionInitByClaudeId = this.wrapHandler((req: Request, res: Response): void => {
-    const { contentSessionId } = req.body;
-
-    // Only contentSessionId is truly required — Cursor and other platforms
-    // may omit prompt/project in their payload (#838, #1049)
-    const project = req.body.project || 'unknown';
-    const prompt = req.body.prompt || '[media prompt]';
+    const rawPrompt = typeof req.body.prompt === 'string' ? req.body.prompt : undefined;
+    const platformSource = this.getPlatformSourceFromRequest(req);
     const customTitle = req.body.customTitle || undefined;
+
+    if (rawPrompt && isInternalProtocolPayload(rawPrompt)) {
+      logger.debug('HTTP', 'session-init: skipping internal protocol payload before session creation', { contentSessionId });
+      res.json({ skipped: true, reason: 'internal_protocol' });
+      return;
+    }
+
+    // Codex's own helper threads (task titles, memory consolidation,
+    // suggestions) arrive like a user turn; Codex only (see the hook handler).
+    if (rawPrompt && platformSource === 'codex' && isCodexInternalPrompt(rawPrompt)) {
+      logger.debug('HTTP', 'session-init: skipping a Codex internal helper prompt before session creation', { contentSessionId });
+      res.json({ skipped: true, reason: 'internal_system_prompt' });
+      return;
+    }
+
+    // A host that runs inside another process (the OpenCode plugin) sends only
+    // its checkout: key it here with the resolver observation ingest uses for
+    // the same host, so init and capture agree (#3803). A hook that resolved
+    // the key itself sends `project` and `projectKeySource`, and those win.
+    const checkoutCwd = typeof req.body.cwd === 'string' ? req.body.cwd : '';
+    const checkoutContext = !req.body.project && checkoutCwd.trim() ? getProjectContext(checkoutCwd) : null;
+    // Such a host cannot check the user's project exclusions either (the CLI
+    // hooks do, before they call): skip before any session row exists.
+    if (checkoutContext) {
+      const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+      if (isProjectExcluded(checkoutCwd, settings.CLAUDE_MEM_EXCLUDED_PROJECTS)) {
+        res.json({ skipped: true, reason: 'project_excluded' });
+        return;
+      }
+    }
+    const project = req.body.project || checkoutContext?.primary || 'unknown';
+    const projectKeySource = checkoutContext ? checkoutContext.keySource : req.body.projectKeySource;
+
+    const slashSkillId = firstPartySkillFromSlashPrompt(rawPrompt);
+    if (slashSkillId) {
+      captureEvent('skill_invoked', {
+        skill_id: slashSkillId,
+        skill_source: 'first_party',
+        skill_trigger: 'prompt',
+        ide: platformSource,
+      });
+    }
+
+    let prompt = rawPrompt || MEDIA_PROMPT_PLACEHOLDER;
+
+    const promptByteLength = Buffer.byteLength(prompt, 'utf8');
+    if (promptByteLength > MAX_USER_PROMPT_BYTES) {
+      logger.warn('HTTP', 'SessionRoutes: oversized prompt truncated at session-init boundary', {
+        project,
+        contentSessionId,
+        promptByteLength,
+        maxBytes: MAX_USER_PROMPT_BYTES,
+        preview: prompt.slice(0, 200)
+      });
+      const buf = Buffer.from(prompt, 'utf8');
+      let end = MAX_USER_PROMPT_BYTES;
+      while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
+      prompt = buf.subarray(0, end).toString('utf8');
+    }
 
     logger.info('HTTP', 'SessionRoutes: handleSessionInitByClaudeId called', {
       contentSessionId,
       project,
+      platformSource,
       prompt_length: prompt?.length,
       customTitle
     });
 
-    // Validate required parameters
-    if (!this.validateRequired(req, res, ['contentSessionId'])) {
-      return;
-    }
-
     const store = this.dbManager.getSessionStore();
 
-    // Step 1: Create/get SDK session (idempotent INSERT OR IGNORE)
-    const sessionDbId = store.createSDKSession(contentSessionId, project, prompt, customTitle);
+    const sessionDbId = store.createSDKSession(contentSessionId, project, prompt, customTitle, platformSource);
 
-    // Verify session creation with DB lookup
+    // The checkout `project` was resolved from, and how it was derived, so a
+    // session that never reports an observation still leaves evidence for
+    // worktree adoption (gate P1-2). An unknown key source is not recorded as
+    // anything: the next observation's ingest records the checkout itself.
+    if (checkoutCwd.trim() && isProjectKeySource(projectKeySource)) {
+      store.setSessionCwd(sessionDbId, checkoutCwd, projectKeySource);
+    }
+
     const dbSession = store.getSessionById(sessionDbId);
     const isNewSession = !dbSession?.memory_session_id;
     logger.info('SESSION', `CREATED | contentSessionId=${contentSessionId} → sessionDbId=${sessionDbId} | isNew=${isNewSession} | project=${project}`, {
       sessionId: sessionDbId
     });
 
-    // Step 2: Get next prompt number from user_prompts count
-    const currentCount = store.getPromptNumberFromUserPrompts(contentSessionId);
-    const promptNumber = currentCount + 1;
+    const currentCount = store.getPromptNumberFromUserPrompts(contentSessionId, sessionDbId);
+    let promptNumber = currentCount + 1;
 
-    // Debug-level alignment logs for detailed tracing
     const memorySessionId = dbSession?.memory_session_id || null;
     if (promptNumber > 1) {
       logger.debug('HTTP', `[ALIGNMENT] DB Lookup Proof | contentSessionId=${contentSessionId} → memorySessionId=${memorySessionId || '(not yet captured)'} | prompt#=${promptNumber}`);
@@ -736,11 +852,18 @@ export class SessionRoutes extends BaseRouteHandler {
       logger.debug('HTTP', `[ALIGNMENT] New Session | contentSessionId=${contentSessionId} | prompt#=${promptNumber} | memorySessionId will be captured on first SDK response`);
     }
 
-    // Step 3: Strip privacy tags from prompt
-    const cleanedPrompt = stripMemoryTagsFromPrompt(prompt);
+    const cleanedPrompt = stripMemoryTags(prompt);
+    const telemetryAttribution = {
+      contentSessionId,
+      enqueuedAtEpochMs: typeof req.body.telemetryPromptEpochMs === 'number' ? req.body.telemetryPromptEpochMs : undefined,
+      platformSource: typeof req.body.telemetryPlatformSource === 'string'
+        ? req.body.telemetryPlatformSource : SessionRoutes.rawPlatformSourceFromRequest(req),
+      agentId: typeof req.body.agentId === 'string' ? req.body.agentId : undefined,
+      agentType: typeof req.body.agentType === 'string' ? req.body.agentType : undefined,
+    };
 
-    // Step 4: Check if prompt is entirely private
     if (!cleanedPrompt || cleanedPrompt.trim() === '') {
+      recordWorkStatePrivacy(store.db, telemetryAttribution, true);
       logger.debug('HOOK', 'Session init - prompt entirely private', {
         sessionId: sessionDbId,
         promptNumber,
@@ -756,25 +879,233 @@ export class SessionRoutes extends BaseRouteHandler {
       return;
     }
 
-    // Step 5: Save cleaned user prompt
-    store.saveUserPrompt(contentSessionId, promptNumber, cleanedPrompt);
+    const nativePromptId = req.body.nativePromptId as string | undefined;
+    const normalizedSdkPrompt = cleanedPrompt.startsWith('/') ? cleanedPrompt.substring(1) : cleanedPrompt;
+    // A native slash-only ask is still a real turn. Keep its cleaned text
+    // when SDK normalization would erase it; legacy normalization is unchanged.
+    const sdkPrompt = nativePromptId ? normalizedSdkPrompt || cleanedPrompt : normalizedSdkPrompt;
+    let nativeAnchor: { id: number; promptNumber: number; duplicate: boolean } | undefined;
+    if (nativePromptId) {
+      try {
+        nativeAnchor = store.saveNativeUserPrompt(contentSessionId, sessionDbId, nativePromptId, cleanedPrompt, rawPrompt || MEDIA_PROMPT_PLACEHOLDER);
+      } catch (error) {
+        if (error instanceof Error && error.message === 'Native prompt identity was reused with different text') {
+          res.status(409).json({ error: error.message });
+          return;
+        }
+        throw error;
+      }
+      promptNumber = nativeAnchor.promptNumber;
+    }
+    // Legacy callers retain same-text retry protection. Native IDs distinguish
+    // intentional repeated prompts without delaying the user's next turn.
+    const duplicatePrompt = nativeAnchor
+      ? (nativeAnchor.duplicate ? { id: nativeAnchor.id, prompt_number: nativeAnchor.promptNumber } : undefined)
+      : store.findRecentDuplicateUserPrompt(contentSessionId, cleanedPrompt, USER_PROMPT_DEDUPE_WINDOW_MS, sessionDbId);
 
-    // Step 6: Check if SDK agent is already running for this session (#1079)
-    // If contextInjected is true, the hook should skip re-initializing the SDK agent
+    // A newer public submission reopens coverage even if its text reuses a row.
+    // The recorder rejects missing/old timestamps and preserves newer boundaries.
+    recordWorkStatePrivacy(store.db, telemetryAttribution, false);
+
+    if (duplicatePrompt) {
+      const activeSession = this.sessionManager.getSession(sessionDbId);
+      // The durable claim can survive an initialization failure. Repair only
+      // a stale live native turn; cold sessions remain lazy and older retries
+      // must never replace a newer prompt's context.
+      if (nativeAnchor && activeSession && activeSession.lastPromptNumber < duplicatePrompt.prompt_number) {
+        this.sessionManager.initializeSession(sessionDbId, sdkPrompt, duplicatePrompt.prompt_number, project);
+      }
+      const contextInjected = activeSession !== undefined;
+      logger.debug('SESSION', 'Duplicate user prompt skipped', {
+        sessionId: sessionDbId,
+        promptNumber: duplicatePrompt.prompt_number,
+        duplicatePromptId: duplicatePrompt.id,
+        contextInjected
+      });
+
+      res.json({
+        sessionDbId,
+        promptNumber: duplicatePrompt.prompt_number,
+        skipped: true,
+        reason: 'duplicate',
+        ...(nativePromptId ? { nativePromptId, nativePromptCurrent:
+          store.getPromptNumberFromUserPrompts(contentSessionId, sessionDbId) === duplicatePrompt.prompt_number
+          && (this.sessionManager.getSession(sessionDbId)?.lastPromptNumber ?? duplicatePrompt.prompt_number) === duplicatePrompt.prompt_number } : {}),
+        contextInjected
+      });
+      return;
+    }
+
+    // A prompt this route ACCEPTS on a row a previous end already completed
+    // means the session carried on, so put it back to active and let the next
+    // end stamp the real completion time (#4080).
+    //
+    // After the privacy and duplicate gates, not before them. Both of those
+    // return early without saving a prompt or starting a generator, so a
+    // reopen above them would clear the completion of a session nothing is
+    // going to finalize again — a retry of an already-saved prompt would leave
+    // the row 'active' for good, which is the bug in the other direction
+    // (#2373). Only this route reopens at all: the observation and summarize
+    // routes can carry trailing traffic from the turn that just ended, where
+    // 'completed' is the truth.
+    let savedUserPromptId: number;
+    if (nativeAnchor) {
+      savedUserPromptId = nativeAnchor.id;
+    } else {
+      store.reopenCompletedSession(sessionDbId);
+      savedUserPromptId = store.saveUserPrompt(contentSessionId, promptNumber, cleanedPrompt, sessionDbId);
+    }
+
+    recordWorkStatePrompt(store.db, telemetryAttribution, savedUserPromptId);
+
+    // Fire-and-forget cloud sync nudge, beside the write itself so every
+    // saved prompt nudges — including cursor sessions, which skip the
+    // non-cursor branch below entirely.
+    this.dbManager.getCloudSync()?.notify();
+
     const contextInjected = this.sessionManager.getSession(sessionDbId) !== undefined;
 
-    // Debug-level log since CREATED already logged the key info
     logger.debug('SESSION', 'User prompt saved', {
       sessionId: sessionDbId,
       promptNumber,
       contextInjected
     });
 
+    if (platformSource !== 'cursor') {
+      const session = this.sessionManager.initializeSession(sessionDbId, sdkPrompt, promptNumber, project);
+
+      // The row this request saved, by id. A newest-by-timestamp lookup can
+      // return a neighbouring turn saved in the same millisecond.
+      const savedUserPrompt = store.getUserPromptById(savedUserPromptId);
+
+      if (savedUserPrompt) {
+        this.eventBroadcaster.broadcastNewPrompt({
+          id: savedUserPrompt.id,
+          content_session_id: savedUserPrompt.content_session_id,
+          project: savedUserPrompt.project,
+          platform_source: savedUserPrompt.platform_source,
+          prompt_number: savedUserPrompt.prompt_number,
+          prompt_text: savedUserPrompt.prompt_text,
+          created_at_epoch: savedUserPrompt.created_at_epoch
+        });
+
+        const chromaStart = Date.now();
+        const promptText = savedUserPrompt.prompt_text;
+        this.dbManager.getChromaSync()?.syncUserPrompt(
+          savedUserPrompt.id,
+          savedUserPrompt.memory_session_id,
+          savedUserPrompt.project,
+          promptText,
+          savedUserPrompt.prompt_number,
+          savedUserPrompt.created_at_epoch,
+          savedUserPrompt.platform_source
+        ).then(() => {
+          const chromaDuration = Date.now() - chromaStart;
+          const truncatedPrompt = promptText.length > 60
+            ? promptText.substring(0, 60) + '...'
+            : promptText;
+          logger.debug('CHROMA', 'User prompt synced', {
+            promptId: savedUserPrompt.id,
+            duration: `${chromaDuration}ms`,
+            prompt: truncatedPrompt
+          });
+        }).catch((error) => {
+          logger.error('CHROMA', 'User prompt sync failed, continuing without vector search', {
+            promptId: savedUserPrompt.id,
+            prompt: promptText.length > 60 ? promptText.substring(0, 60) + '...' : promptText
+          }, error);
+        });
+      }
+
+      await this.ensureGeneratorRunning(sessionDbId, 'init');
+
+      this.eventBroadcaster.broadcastSessionStarted(sessionDbId, session.project);
+    } else {
+      // Cursor creates its observer lazily, but accepted prompts still update an existing session.
+      if (this.sessionManager.getSession(sessionDbId)) {
+        this.sessionManager.initializeSession(sessionDbId, sdkPrompt, promptNumber, project);
+      }
+      logger.debug('HTTP', 'session-init: Skipping SDK agent init for Cursor platform', { sessionDbId, promptNumber });
+    }
+
     res.json({
       sessionDbId,
       promptNumber,
       skipped: false,
-      contextInjected
+      ...(nativePromptId ? { nativePromptId, nativePromptCurrent:
+        store.getPromptNumberFromUserPrompts(contentSessionId, sessionDbId) === promptNumber
+        && (this.sessionManager.getSession(sessionDbId)?.lastPromptNumber ?? promptNumber) === promptNumber } : {}),
+      contextInjected,
+      status: 'initialized'
     });
   });
+
+  private static readonly SIMPLE_TOOLS = new Set([
+    'Read', 'Glob', 'Grep', 'LS', 'ListMcpResourcesTool'
+  ]);
+
+  private async applyTierRouting(session: NonNullable<ReturnType<typeof this.sessionManager.getSession>>): Promise<void> {
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    if (settings.CLAUDE_MEM_TIER_ROUTING_ENABLED === 'false') {
+      session.modelOverride = undefined;
+      return;
+    }
+
+    session.modelOverride = undefined;
+
+    const pending = this.sessionManager.getMessageBuffer().peekTypes(session.sessionDbId);
+
+    if (pending.length === 0) {
+      session.modelOverride = undefined;
+      return;
+    }
+
+    const hasSummarize = pending.some(m => m.message_type === 'summarize');
+    const allSimple = pending.every(m =>
+      m.message_type === 'observation' && m.tool_name && SessionRoutes.SIMPLE_TOOLS.has(m.tool_name)
+    );
+
+    if (hasSummarize) {
+      const summaryModel = settings.CLAUDE_MEM_TIER_SUMMARY_MODEL;
+      if (summaryModel) {
+        session.modelOverride = summaryModel;
+        logger.debug('SESSION', `Tier routing: summary model`, {
+          sessionId: session.sessionDbId, model: summaryModel
+        });
+      }
+    } else if (allSimple) {
+      const simpleModel = settings.CLAUDE_MEM_TIER_SIMPLE_MODEL;
+      if (simpleModel) {
+        session.modelOverride = simpleModel;
+        logger.debug('SESSION', `Tier routing: simple model`, {
+          sessionId: session.sessionDbId, model: simpleModel
+        });
+      }
+    } else {
+      session.modelOverride = undefined;
+    }
+  }
+
+  /**
+   * On a quota-fallback run, run Claude on CLAUDE_MEM_QUOTA_FALLBACK_MODEL.
+   * Applied after tier routing so it wins for this run only; a deliberate
+   * Claude-primary run, or an empty setting, keeps whatever tier routing and
+   * CLAUDE_MEM_MODEL chose. Only ClaudeProvider reads modelOverride, which is
+   * why the setting does nothing for any other fallback.
+   */
+  private applyQuotaFallbackModel(
+    session: NonNullable<ReturnType<typeof this.sessionManager.getSession>>,
+    provider: SelectableProvider,
+    fallbackFrom: SelectableProvider | null,
+  ): void {
+    if (fallbackFrom === null || provider !== 'claude') return;
+    const model = (SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH).CLAUDE_MEM_QUOTA_FALLBACK_MODEL ?? '').trim();
+    if (!model) return;
+    session.modelOverride = model;
+    logger.info('SESSION', 'Quota fallback run uses the configured fallback model', {
+      sessionId: session.sessionDbId,
+      model,
+      fallbackFrom,
+    });
+  }
 }

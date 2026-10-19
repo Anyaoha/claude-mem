@@ -1,23 +1,37 @@
 import { existsSync, readFileSync, rmSync } from 'fs';
-import { homedir } from 'os';
-import path from 'path';
 import { logger } from '../utils/logger.js';
-import { getProcessRegistry, isPidAlive, type ManagedProcessInfo, type ProcessRegistry } from './process-registry.js';
+import {
+  getProcessRegistry,
+  verifyWorkerPidFileOwnership,
+  type ManagedProcessInfo,
+  type PidInfo,
+  type ProcessRegistry
+} from './process-registry.js';
 import { runShutdownCascade } from './shutdown.js';
 import { startHealthChecker, stopHealthChecker } from './health-checker.js';
+import { sweepOrphanedChromaTrees } from './orphan-chroma-sweep.js';
+import { paths } from '../shared/paths.js';
 
-const DATA_DIR = path.join(homedir(), '.claude-mem');
-const PID_FILE = path.join(DATA_DIR, 'worker.pid');
+// Moved beside worker PID verification so npx-cli callers can read the PID file
+// without importing the supervisor; re-exported so existing imports keep working.
+export { readOwnedWorkerPidInfo } from './process-registry.js';
 
-interface PidInfo {
-  pid: number;
-  port: number;
-  startedAt: string;
-}
+const PID_FILE = paths.workerPid();
 
 interface ValidateWorkerPidOptions {
   logAlive?: boolean;
   pidFilePath?: string;
+  /**
+   * I-4 (bwrap --unshare-pid): a caller inside a PID namespace gets ESRCH
+   * from process.kill(hostPid, 0) even when the host worker is healthy, so
+   * this validator alone cannot distinguish "dead" from "invisible". A
+   * caller that has already proven liveness some other way (HTTP health
+   * probe) can pass removeStale:false to inspect the file without deleting
+   * it out from under a perfectly healthy host worker. Defaults to true so
+   * every other caller (including the supervisor boot path) keeps deleting
+   * a genuinely stale file exactly as before.
+   */
+  removeStale?: boolean;
 }
 
 export type ValidateWorkerPidStatus = 'missing' | 'alive' | 'stale' | 'invalid';
@@ -45,6 +59,16 @@ class Supervisor {
 
     this.started = true;
 
+    // Reap chroma-mcp trees that no worker owns (#3905). Detached and best-effort: the sweep reads
+    // the process table, so it must never gate boot, and a failure leaves the pre-sweep state.
+    // It runs here, after initialize() and before anything of ours is spawned, so every signature
+    // tree in the table with a dead or PID-1 parent is by construction someone else's leftover.
+    void sweepOrphanedChromaTrees({ registry: this.registry }).catch((error: unknown) => {
+      logger.warn('PROCESS', 'Orphaned chroma-mcp sweep failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+
     startHealthChecker();
   }
 
@@ -69,12 +93,20 @@ class Supervisor {
         } else {
           await this.stop();
         }
-      } catch (error) {
-        logger.error('SYSTEM', 'Error during shutdown', {}, error as Error);
+      } catch (error: unknown) {
+        if (error instanceof Error) {
+          logger.error('SYSTEM', 'Error during shutdown', {}, error);
+        } else {
+          logger.error('SYSTEM', 'Error during shutdown (non-Error)', { error: String(error) });
+        }
         try {
           await this.stop();
-        } catch (stopError) {
-          logger.debug('SYSTEM', 'Supervisor shutdown fallback failed', {}, stopError as Error);
+        } catch (stopError: unknown) {
+          if (stopError instanceof Error) {
+            logger.debug('SYSTEM', 'Supervisor shutdown fallback failed', {}, stopError);
+          } else {
+            logger.debug('SYSTEM', 'Supervisor shutdown fallback failed', { error: String(stopError) });
+          }
         }
       }
 
@@ -123,8 +155,8 @@ class Supervisor {
     this.registry.register(id, processInfo, processRef);
   }
 
-  unregisterProcess(id: string): void {
-    this.registry.unregister(id);
+  unregisterProcess(id: string, expectedPid?: number): void {
+    this.registry.unregister(id, expectedPid);
   }
 
   getRegistry(): ProcessRegistry {
@@ -136,10 +168,6 @@ const supervisorSingleton = new Supervisor(getProcessRegistry());
 
 export async function startSupervisor(): Promise<void> {
   await supervisorSingleton.start();
-}
-
-export async function stopSupervisor(): Promise<void> {
-  await supervisorSingleton.stop();
 }
 
 export function getSupervisor(): Supervisor {
@@ -160,14 +188,22 @@ export function validateWorkerPidFile(options: ValidateWorkerPidOptions = {}): V
   let pidInfo: PidInfo | null = null;
 
   try {
-    pidInfo = JSON.parse(readFileSync(pidFilePath, 'utf-8')) as PidInfo;
-  } catch (error) {
-    logger.warn('SYSTEM', 'Failed to parse worker PID file, removing it', { path: pidFilePath }, error as Error);
+    pidInfo = JSON.parse(readFileSync(pidFilePath, 'utf-8')) as PidInfo | null;
+  } catch (error: unknown) {
+    if (error instanceof Error) {
+      logger.warn('SYSTEM', 'Failed to parse worker PID file, removing it', { path: pidFilePath }, error);
+    } else {
+      logger.warn('SYSTEM', 'Failed to parse worker PID file, removing it', {
+        path: pidFilePath,
+        error: String(error)
+      });
+    }
     rmSync(pidFilePath, { force: true });
     return 'invalid';
   }
 
-  if (isPidAlive(pidInfo.pid)) {
+  const isAlive = verifyWorkerPidFileOwnership(pidInfo);
+  if (isAlive && pidInfo) {
     if (options.logAlive ?? true) {
       logger.info('SYSTEM', 'Worker already running (PID alive)', {
         existingPid: pidInfo.pid,
@@ -178,10 +214,14 @@ export function validateWorkerPidFile(options: ValidateWorkerPidOptions = {}): V
     return 'alive';
   }
 
-  logger.info('SYSTEM', 'Removing stale PID file (worker process is dead)', {
-    pid: pidInfo.pid,
-    port: pidInfo.port,
-    startedAt: pidInfo.startedAt
+  if (options.removeStale === false) {
+    return 'stale';
+  }
+
+  logger.info('SYSTEM', 'Removing stale PID file (worker process is dead or PID has been reused)', {
+    pid: pidInfo?.pid,
+    port: pidInfo?.port,
+    startedAt: pidInfo?.startedAt
   });
   rmSync(pidFilePath, { force: true });
   return 'stale';

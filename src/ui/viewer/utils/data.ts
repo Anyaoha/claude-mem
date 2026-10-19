@@ -1,25 +1,27 @@
-/**
- * Data manipulation utility functions
- * Used for merging and deduplicating real-time and paginated data
- */
+import { Observation, Summary, UserPrompt, FeedItem } from '../types';
 
-/**
- * Merge real-time SSE items with paginated items, removing duplicates by ID
- * Callers should pre-filter liveItems by project when a filter is active.
- *
- * @param liveItems - Items from SSE stream (pre-filtered if needed)
- * @param paginatedItems - Items from pagination API
- * @returns Merged and deduplicated array
- */
 export function mergeAndDeduplicateByProject<T extends { id: number; project?: string }>(
   liveItems: T[],
   paginatedItems: T[]
 ): T[] {
-  // Deduplicate by ID
   const seen = new Set<number>();
   return [...liveItems, ...paginatedItems].filter(item => {
     if (seen.has(item.id)) return false;
     seen.add(item.id);
     return true;
   });
+}
+
+export function buildFeedItems(
+  observations: Observation[],
+  summaries: Summary[],
+  prompts: UserPrompt[]
+): FeedItem[] {
+  const combined: FeedItem[] = [
+    ...observations.map(o => ({ ...o, itemType: 'observation' as const })),
+    ...summaries.map(s => ({ ...s, itemType: 'summary' as const })),
+    ...prompts.map(p => ({ ...p, itemType: 'prompt' as const }))
+  ];
+
+  return combined.sort((a, b) => b.created_at_epoch - a.created_at_epoch);
 }

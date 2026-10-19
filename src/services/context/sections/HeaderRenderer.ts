@@ -1,59 +1,57 @@
-/**
- * HeaderRenderer - Renders the context header sections
- *
- * Handles rendering of header, legend, column key, context index, and economics.
- */
 
 import type { ContextConfig, TokenEconomics } from '../types.js';
 import { shouldShowContextEconomics } from '../TokenCalculator.js';
-import * as Markdown from '../formatters/MarkdownFormatter.js';
-import * as Color from '../formatters/ColorFormatter.js';
+import { loadProjectEnvironments } from '../../../utils/project-name.js';
+import * as Agent from '../formatters/AgentFormatter.js';
+import * as Human from '../formatters/HumanFormatter.js';
 
 /**
- * Render the complete header section
+ * A named environment spans several directories; say so in the header so the
+ * model does not read the project name as one folder. The name only: the glob
+ * patterns would cost tokens on every session and add nothing for the model.
  */
+function projectHeaderLabel(project: string): string {
+  return loadProjectEnvironments().some(environment => environment.name === project)
+    ? `${project} (environment)`
+    : project;
+}
+
 export function renderHeader(
   project: string,
   economics: TokenEconomics,
   config: ContextConfig,
-  useColors: boolean
+  forHuman: boolean,
+  /** The header's date and time; a placeholder when the block is cached (context-cache.ts). */
+  headerTime?: string
 ): string[] {
   const output: string[] = [];
+  const fetchByIdSupported = config.fetchByIdSupported !== false;
+  const projectDisplay = projectHeaderLabel(project);
 
-  // Main header
-  if (useColors) {
-    output.push(...Color.renderColorHeader(project));
+  if (forHuman) {
+    output.push(...Human.renderHumanHeader(projectDisplay, headerTime));
   } else {
-    output.push(...Markdown.renderMarkdownHeader(project));
+    output.push(...Agent.renderAgentHeader(projectDisplay, headerTime));
   }
 
-  // Legend
-  if (useColors) {
-    output.push(...Color.renderColorLegend());
+  if (forHuman) {
+    output.push(...Human.renderHumanLegend());
   } else {
-    output.push(...Markdown.renderMarkdownLegend());
+    output.push(...Agent.renderAgentLegend(fetchByIdSupported));
   }
 
-  // Column key
-  if (useColors) {
-    output.push(...Color.renderColorColumnKey());
-  } else {
-    output.push(...Markdown.renderMarkdownColumnKey());
+  // Agent variants render nothing; only the Human column-key / context-index
+  // arms produce output.
+  if (forHuman) {
+    output.push(...Human.renderHumanColumnKey());
+    output.push(...Human.renderHumanContextIndex(fetchByIdSupported));
   }
 
-  // Context index instructions
-  if (useColors) {
-    output.push(...Color.renderColorContextIndex());
-  } else {
-    output.push(...Markdown.renderMarkdownContextIndex());
-  }
-
-  // Context economics
   if (shouldShowContextEconomics(config)) {
-    if (useColors) {
-      output.push(...Color.renderColorContextEconomics(economics, config));
+    if (forHuman) {
+      output.push(...Human.renderHumanContextEconomics(economics, config));
     } else {
-      output.push(...Markdown.renderMarkdownContextEconomics(economics, config));
+      output.push(...Agent.renderAgentContextEconomics(economics, config));
     }
   }
 

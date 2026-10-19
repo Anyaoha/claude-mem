@@ -3,6 +3,7 @@ import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
 import { validateWorkerPidFile, type ValidateWorkerPidStatus } from '../../src/supervisor/index.js';
+import { captureProcessStartToken } from '../../src/supervisor/process-registry.js';
 
 function makeTempDir(): string {
   const dir = path.join(tmpdir(), `claude-mem-index-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -59,14 +60,34 @@ describe('validateWorkerPidFile', () => {
     const tempDir = makeTempDir();
     tempDirs.push(tempDir);
     const pidFilePath = path.join(tempDir, 'worker.pid');
+    // With its start token, as every worker since v12.3.8 writes it. A
+    // token-less record must also name worker-service.cjs on Linux (#4270),
+    // which the test runner's command line does not.
     writeFileSync(pidFilePath, JSON.stringify({
       pid: process.pid,
       port: 37777,
-      startedAt: new Date().toISOString()
+      startedAt: new Date().toISOString(),
+      startToken: captureProcessStartToken(process.pid) ?? undefined
     }));
 
     const status = validateWorkerPidFile({ logAlive: false, pidFilePath });
     expect(status).toBe('alive');
+  });
+
+  const tokenSupported = process.platform === 'linux' || process.platform === 'darwin';
+  it.if(tokenSupported)('returns "stale" when startToken does not match the live PID (PID reused)', () => {
+    const tempDir = makeTempDir();
+    tempDirs.push(tempDir);
+    const pidFilePath = path.join(tempDir, 'worker.pid');
+    writeFileSync(pidFilePath, JSON.stringify({
+      pid: process.pid,
+      port: 37777,
+      startedAt: new Date().toISOString(),
+      startToken: 'token-from-a-different-incarnation'
+    }));
+
+    const status = validateWorkerPidFile({ logAlive: false, pidFilePath });
+    expect(status).toBe('stale');
   });
 });
 
@@ -75,7 +96,6 @@ describe('Supervisor assertCanSpawn behavior', () => {
     const { getSupervisor } = require('../../src/supervisor/index.js');
     const supervisor = getSupervisor();
 
-    // When not shutting down, assertCanSpawn should not throw
     expect(() => supervisor.assertCanSpawn('test')).not.toThrow();
   });
 

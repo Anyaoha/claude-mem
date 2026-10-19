@@ -1,62 +1,265 @@
-/**
- * SessionManager: Event-driven session lifecycle
- *
- * Responsibility:
- * - Manage active session lifecycle
- * - Handle event-driven message queues
- * - Coordinate between HTTP requests and SDK agent
- * - Zero-latency event notification (no polling)
- */
-
-import { EventEmitter } from 'events';
 import { DatabaseManager } from './DatabaseManager.js';
 import { logger } from '../../utils/logger.js';
+import { redactForLog } from '../../utils/redaction.js';
 import type { ActiveSession, PendingMessage, PendingMessageWithId, ObservationData } from '../worker-types.js';
-import { PendingMessageStore } from '../sqlite/PendingMessageStore.js';
-import { SessionQueueProcessor } from '../queue/SessionQueueProcessor.js';
-import { getProcessBySession, ensureProcessExit } from './ProcessRegistry.js';
+import { SessionMessageBuffer } from './SessionMessageBuffer.js';
+import { getSdkProcessForSession, ensureSdkProcessExit } from '../../supervisor/process-registry.js';
 import { getSupervisor } from '../../supervisor/index.js';
+import { telemetryBuffer } from '../telemetry/buffer.js';
+import { deliverSessionWrapup, type TelegramWrapupFormatter } from '../integrations/TelegramWrapupNotifier.js';
+import { MAX_LLM_TIMEOUT_MS, resolveLlmTimeoutMs } from './retry.js';
+import { canCmemGatewayServe } from '../../shared/cmem-gateway.js';
+import { planUnattendedGatewayResume, unattendedGatewayResumesSpent } from './session/response-pacer.js';
+
+export const SESSION_END_WRAPUP_GRACE_MS = 5_000;
+
+export interface TransportResumeClock {
+  setTimeout(callback: () => void, delayMs: number): ReturnType<typeof setTimeout>;
+  clearTimeout(timer: ReturnType<typeof setTimeout>): void;
+}
+
+const defaultTransportResumeClock: TransportResumeClock = {
+  setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+  clearTimeout: timer => clearTimeout(timer),
+};
+
+// The nominal interval stops at the largest supported request timeout.
+// Jitter remains after that cap so sessions that failed together do not
+// synchronize their probes during a shared provider outage.
+export const MAX_TRANSPORT_RESUME_BASE_DELAY_MS = MAX_LLM_TIMEOUT_MS;
+
+export function transportResumeDelayMs(consecutivePauses: number): number {
+  const nominalMs = Math.min(
+    resolveLlmTimeoutMs() * Math.pow(2, Math.max(0, consecutivePauses - 1)),
+    MAX_TRANSPORT_RESUME_BASE_DELAY_MS,
+  );
+  return Math.floor(nominalMs + Math.random() * nominalMs / 4);
+}
+
+type TransportResumeState = { pauses: number; timer?: ReturnType<typeof setTimeout> };
+type ReadyTransportResume = {
+  sessionDbId: number;
+  session: ActiveSession;
+  state: TransportResumeState;
+};
 
 export class SessionManager {
   private dbManager: DatabaseManager;
   private sessions: Map<number, ActiveSession> = new Map();
-  private sessionQueues: Map<number, EventEmitter> = new Map();
-  private onSessionDeletedCallback?: () => void;
-  private pendingStore: PendingMessageStore | null = null;
+  private onPendingMutate?: () => void;
+  private telegramWrapupFormatter: TelegramWrapupFormatter | null = null;
+  private readonly buffer = new SessionMessageBuffer(() => this.onPendingMutate?.());
+  private generatorStarter: ((sessionDbId: number, source: string) => void | Promise<void>) | null = null;
+  private transportResumes = new Map<number, TransportResumeState>();
+  private transportResumeReady: ReadyTransportResume[] = [];
+  private activeTransportResume: ReadyTransportResume | null = null;
+  private deletingSessions = new Set<number>();
+  private transportResumeDispositionEpochs = new WeakMap<ActiveSession, number>();
+  /** Sessions that already used their one summarize rescue (#3419). */
+  private readonly summarizeRescues = new Set<number>();
 
-  constructor(dbManager: DatabaseManager) {
+  constructor(
+    dbManager: DatabaseManager,
+    private readonly transportResumeClock: TransportResumeClock = defaultTransportResumeClock,
+  ) {
     this.dbManager = dbManager;
   }
 
+  setOnPendingMutate(cb: () => void): void {
+    this.onPendingMutate = cb;
+  }
+
+  setGeneratorStarter(starter: (sessionDbId: number, source: string) => void | Promise<void>): void {
+    this.generatorStarter = starter;
+  }
+
   /**
-   * Get or create PendingMessageStore (lazy initialization to avoid circular dependency)
+   * Park the last-sent batch when its PaidSendBudget is spent: it is never
+   * resent, by any path, and stays visible in the buffer (getParkedMessages)
+   * until the session ends, while newer work keeps flowing. Returns the ids
+   * parked; none when the budget has a send left or the batch was stored.
    */
-  private getPendingStore(): PendingMessageStore {
-    if (!this.pendingStore) {
-      const sessionStore = this.dbManager.getSessionStore();
-      this.pendingStore = new PendingMessageStore(sessionStore.db, 3);
+  parkBatchOnSpentPaidSendBudget(session: ActiveSession): number[] {
+    const budget = session.paidSendBudget;
+    if (!budget || budget.hasRemainingPaidSend()) return [];
+    session.paidSendBudget = undefined;
+    const parkedMessageIds = this.buffer.park(session.sessionDbId, [...budget.batchMessageIds], budget.clientAttemptId);
+    if (parkedMessageIds.length > 0) {
+      logger.error('SESSION', 'Batch parked: its paid-send budget is spent, so it is not resent', {
+        sessionId: session.sessionDbId,
+        parkedMessageIds,
+        paidSendsSpent: budget.spentPaidSends,
+        maxPaidSends: budget.maxPaidSends,
+        clientAttemptId: budget.clientAttemptId,
+        pendingCount: this.buffer.getPendingCount(session.sessionDbId),
+      });
     }
-    return this.pendingStore;
+    return parkedMessageIds;
   }
 
-  /**
-   * Set callback to be called when a session is deleted (for broadcasting status)
-   */
-  setOnSessionDeleted(callback: () => void): void {
-    this.onSessionDeletedCallback = callback;
+  /** Resume preserved transport work without requiring another hook from the IDE. */
+  scheduleTransportResume(sessionDbId: number): void {
+    const session = this.sessions.get(sessionDbId);
+    if (!session || this.deletingSessions.has(sessionDbId)) return;
+    // A resume resends the batch; one whose budget is spent is parked instead,
+    // and only work behind it, if any, is resumed.
+    this.parkBatchOnSpentPaidSendBudget(session);
+    if (this.buffer.getPendingCount(sessionDbId) === 0) return;
+    if (!this.generatorStarter) {
+      logger.error('SESSION', 'Cannot schedule transport resume: generator starter is not attached', { sessionId: sessionDbId });
+      return;
+    }
+
+    const prior = this.transportResumes.get(sessionDbId);
+    if (prior?.timer) this.transportResumeClock.clearTimeout(prior.timer);
+    const pauses = (prior?.pauses ?? 0) + 1;
+    // Each unattended resume on the cmem gateway spends plan tokens; this one
+    // shares its budget with rate-limit and fallback resumes. Spent, the pause
+    // keeps its backoff position without a timer, and the next hook-driven
+    // start still drains the buffer.
+    if (!planUnattendedGatewayResume(session, 'transport-resume', canCmemGatewayServe()).resume) {
+      this.transportResumes.set(sessionDbId, { pauses });
+      return;
+    }
+    const delayMs = transportResumeDelayMs(pauses);
+    const state: TransportResumeState = { pauses };
+    const timer = this.transportResumeClock.setTimeout(() => {
+      if (this.transportResumes.get(sessionDbId) !== state || state.timer !== timer) return;
+      state.timer = undefined;
+      const ready = { sessionDbId, session, state };
+      if (!this.canResumeTransport(ready)) {
+        this.transportResumes.delete(sessionDbId);
+        return;
+      }
+      this.transportResumeReady.push(ready);
+      this.pumpTransportResumes();
+    }, delayMs);
+    timer.unref?.();
+    state.timer = timer;
+    this.transportResumes.set(sessionDbId, state);
+    logger.warn('SESSION', 'Transport pause: scheduled buffered-work resume', { sessionId: sessionDbId, pauses, delayMs });
   }
 
-  /**
-   * Initialize a new session or return existing one
-   */
-  initializeSession(sessionDbId: number, currentUserPrompt?: string, promptNumber?: number): ActiveSession {
+  private canResumeTransport(ready: ReadyTransportResume): boolean {
+    return this.sessions.get(ready.sessionDbId) === ready.session
+      && !this.deletingSessions.has(ready.sessionDbId)
+      && this.transportResumes.get(ready.sessionDbId) === ready.state
+      && this.buffer.getPendingCount(ready.sessionDbId) > 0;
+  }
+
+  /** Start one unattended probe at a time; ready sessions retain FIFO order. */
+  private pumpTransportResumes(): void {
+    if (this.activeTransportResume) return;
+    while (this.transportResumeReady.length > 0) {
+      const ready = this.transportResumeReady.shift()!;
+      if (!this.canResumeTransport(ready)) continue;
+      // A hook already restarted this session. Do not occupy the automatic
+      // probe slot, but watch its completion. An explicit pause decision
+      // clears the state, so it cannot rearm after the generator settles.
+      if (ready.session.generatorPromise) {
+        this.rearmAfterRunningGenerator(ready, ready.session.generatorPromise);
+        continue;
+      }
+      this.activeTransportResume = ready;
+      void Promise.resolve()
+        .then(() => {
+          if (!this.canResumeTransport(ready) || this.activeTransportResume !== ready) return;
+          return this.generatorStarter?.(ready.sessionDbId, 'transport-resume');
+        })
+        .catch(error => {
+          logger.error('SESSION', 'Failed to resume observer after transport pause', { sessionId: ready.sessionDbId },
+            error instanceof Error ? error : new Error(String(error)));
+        })
+        .then(() => {
+          if (this.activeTransportResume !== ready) return;
+          const generator = ready.session.generatorPromise;
+          if (!generator) {
+            // Quota and overflow admission can decline without a generator exit.
+            this.finishTransportResume(ready);
+            return;
+          }
+          void generator.then(
+            () => this.finishTransportResume(ready),
+            () => this.finishTransportResume(ready),
+          );
+        });
+      return;
+    }
+  }
+
+  private rearmAfterRunningGenerator(ready: ReadyTransportResume, running: Promise<void>): void {
+    const onSettled = () => {
+      if (!this.canResumeTransport(ready) || ready.state.timer) return;
+      const current = ready.session.generatorPromise;
+      if (current && current !== running) {
+        this.rearmAfterRunningGenerator(ready, current);
+        return;
+      }
+      // A failed finalizer can leave its already-settled promise in the
+      // session. It no longer owns the generator slot, so clear that stale
+      // reference before scheduling the next attempt.
+      if (current === running) ready.session.generatorPromise = null;
+      try {
+        this.scheduleTransportResume(ready.sessionDbId);
+      } catch (error) {
+        logger.error('SESSION', 'Failed to rearm transport resume after hook generator', { sessionId: ready.sessionDbId },
+          error instanceof Error ? error : new Error(String(error)));
+      }
+    };
+    void running.then(onSettled, onSettled);
+  }
+
+  private finishTransportResume(ready: ReadyTransportResume): void {
+    if (this.activeTransportResume !== ready) return;
+    this.activeTransportResume = null;
+    // A declined start has no exit to schedule its next attempt. A completed
+    // generator may have scheduled a new state; the identity check excludes it.
+    try {
+      if (this.canResumeTransport(ready) && !ready.state.timer
+        && !ready.session.generatorPromise) {
+        this.scheduleTransportResume(ready.sessionDbId);
+      }
+    } catch (error) {
+      logger.error('SESSION', 'Failed to schedule another transport resume', { sessionId: ready.sessionDbId },
+        error instanceof Error ? error : new Error(String(error)));
+    } finally {
+      this.pumpTransportResumes();
+    }
+  }
+
+  clearTransportResume(sessionDbId: number): void {
+    const session = this.sessions.get(sessionDbId);
+    if (session) {
+      this.transportResumeDispositionEpochs.set(session,
+        (this.transportResumeDispositionEpochs.get(session) ?? 0) + 1);
+    }
+    const state = this.transportResumes.get(sessionDbId);
+    if (state?.timer) this.transportResumeClock.clearTimeout(state.timer);
+    this.transportResumes.delete(sessionDbId);
+    if (this.activeTransportResume?.sessionDbId === sessionDbId) {
+      this.activeTransportResume = null;
+      this.pumpTransportResumes();
+    }
+  }
+
+  setTelegramWrapupFormatter(formatter: TelegramWrapupFormatter): void {
+    this.telegramWrapupFormatter = formatter;
+  }
+
+  initializeSession(
+    sessionDbId: number,
+    currentUserPrompt?: string,
+    promptNumber?: number,
+    currentProject?: string,
+  ): ActiveSession {
+    const suppliedProject = currentProject && currentProject !== 'unknown' ? currentProject : undefined;
+
     logger.debug('SESSION', 'initializeSession called', {
       sessionDbId,
       promptNumber,
       has_currentUserPrompt: !!currentUserPrompt
     });
 
-    // Check if already active
     let session = this.sessions.get(sessionDbId);
     if (session) {
       logger.debug('SESSION', 'Returning cached session', {
@@ -65,11 +268,8 @@ export class SessionManager {
         lastPromptNumber: session.lastPromptNumber
       });
 
-      // Refresh project from database in case it was updated by new-hook
-      // This fixes the bug where sessions created with empty project get updated
-      // in the database but the in-memory session still has the stale empty value
       const dbSession = this.dbManager.getSessionById(sessionDbId);
-      if (dbSession.project && dbSession.project !== session.project) {
+      if (dbSession.project && dbSession.project !== session.project && !suppliedProject) {
         logger.debug('SESSION', 'Updating project from database', {
           sessionDbId,
           oldProject: session.project,
@@ -77,13 +277,24 @@ export class SessionManager {
         });
         session.project = dbSession.project;
       }
+      if (suppliedProject) {
+        session.project = suppliedProject;
+      }
+      if (dbSession.platform_source && dbSession.platform_source !== session.platformSource) {
+        session.platformSource = dbSession.platform_source;
+      }
+      if (dbSession.observed_model && dbSession.observed_model !== session.observedModel) {
+        session.observedModel = dbSession.observed_model;
+      }
+      if (dbSession.observed_billing && dbSession.observed_billing !== session.observedBilling) {
+        session.observedBilling = dbSession.observed_billing;
+      }
 
-      // Update userPrompt for continuation prompts
       if (currentUserPrompt) {
         logger.debug('SESSION', 'Updating userPrompt for continuation', {
           sessionDbId,
           promptNumber,
-          oldPrompt: session.userPrompt.substring(0, 80),
+          oldPrompt: session.userPrompt?.substring(0, 80) ?? '',
           newPrompt: currentUserPrompt.substring(0, 80)
         });
         session.userPrompt = currentUserPrompt;
@@ -92,13 +303,12 @@ export class SessionManager {
         logger.debug('SESSION', 'No currentUserPrompt provided for existing session', {
           sessionDbId,
           promptNumber,
-          usingCachedPrompt: session.userPrompt.substring(0, 80)
+          usingCachedPrompt: session.userPrompt?.substring(0, 80) ?? ''
         });
       }
       return session;
     }
 
-    // Fetch from database
     const dbSession = this.dbManager.getSessionById(sessionDbId);
 
     logger.debug('SESSION', 'Fetched session from database', {
@@ -107,7 +317,6 @@ export class SessionManager {
       memory_session_id: dbSession.memory_session_id
     });
 
-    // Log warning if we're discarding a stale memory_session_id (Issue #817)
     if (dbSession.memory_session_id) {
       logger.warn('SESSION', `Discarding stale memory_session_id from previous worker instance (Issue #817)`, {
         sessionDbId,
@@ -116,14 +325,22 @@ export class SessionManager {
       });
     }
 
-    // Use currentUserPrompt if provided, otherwise fall back to database (first prompt)
-    const userPrompt = currentUserPrompt || dbSession.user_prompt;
+    const latestPromptText = currentUserPrompt
+      ? null
+      : this.dbManager.getSessionStore().getLatestPromptTextFromUserPrompts(
+          dbSession.content_session_id,
+          sessionDbId,
+        );
+    const userPrompt = currentUserPrompt || latestPromptText || dbSession.user_prompt;
 
     if (!currentUserPrompt) {
-      logger.debug('SESSION', 'No currentUserPrompt provided for new session, using database', {
+      logger.debug('SESSION', latestPromptText
+        ? 'No currentUserPrompt provided for new session, using latest user_prompts'
+        : 'No currentUserPrompt provided for new session, using database', {
         sessionDbId,
         promptNumber,
-        dbPrompt: dbSession.user_prompt.substring(0, 80)
+        latestPrompt: latestPromptText?.substring(0, 80) ?? '',
+        dbPrompt: dbSession.user_prompt?.substring(0, 80) ?? ''
       });
     } else {
       logger.debug('SESSION', 'Initializing session with fresh userPrompt', {
@@ -133,31 +350,32 @@ export class SessionManager {
       });
     }
 
-    // Create active session
-    // CRITICAL: Do NOT load memorySessionId from database here (Issue #817)
-    // When creating a new in-memory session, any database memory_session_id is STALE
-    // because the SDK context was lost when the worker restarted. The SDK agent will
-    // capture a new memorySessionId on the first response and persist it.
-    // Loading stale memory_session_id causes "No conversation found" crashes on resume.
     session = {
       sessionDbId,
       contentSessionId: dbSession.content_session_id,
       memorySessionId: null,  // Always start fresh - SDK will capture new ID
-      project: dbSession.project,
+      project: suppliedProject || dbSession.project,
+      platformSource: dbSession.platform_source,
+      observedModel: dbSession.observed_model ?? undefined,
+      observedBilling: dbSession.observed_billing ?? undefined,
       userPrompt,
-      pendingMessages: [],
       abortController: new AbortController(),
       generatorPromise: null,
-      lastPromptNumber: promptNumber || this.dbManager.getSessionStore().getPromptNumberFromUserPrompts(dbSession.content_session_id),
+      lastPromptNumber: promptNumber || this.dbManager.getSessionStore().getPromptNumberFromUserPrompts(dbSession.content_session_id, sessionDbId),
       startTime: Date.now(),
       cumulativeInputTokens: 0,
       cumulativeOutputTokens: 0,
       earliestPendingTimestamp: null,
+      claimedMessageIds: [],
       conversationHistory: [],  // Initialize empty - will be populated by agents
       currentProvider: null,  // Will be set when generator starts
-      consecutiveRestarts: 0,  // Track consecutive restart attempts to prevent infinite loops
-      processingMessageIds: [],  // CLAIM-CONFIRM: Track message IDs for confirmProcessed()
-      lastGeneratorActivity: Date.now()  // Initialize for stale detection (Issue #1099)
+      consecutiveRestarts: 0,
+      consecutiveInvalidOutputs: 0,
+      consecutiveContextOverflows: 0,
+      lastGeneratorActivity: Date.now(),  // Initialize for stale detection (Issue #1099)
+      pendingAgentId: null,   // Subagent identity carried from the most recent claimed message
+      pendingAgentType: null,
+      pausedReason: null
     };
 
     logger.debug('SESSION', 'Creating new session object (memorySessionId cleared to prevent stale resume)', {
@@ -165,14 +383,10 @@ export class SessionManager {
       contentSessionId: dbSession.content_session_id,
       dbMemorySessionId: dbSession.memory_session_id || '(none in DB)',
       memorySessionId: '(cleared - will capture fresh from SDK)',
-      lastPromptNumber: promptNumber || this.dbManager.getSessionStore().getPromptNumberFromUserPrompts(dbSession.content_session_id)
+      lastPromptNumber: promptNumber || this.dbManager.getSessionStore().getPromptNumberFromUserPrompts(dbSession.content_session_id, sessionDbId)
     });
 
     this.sessions.set(sessionDbId, session);
-
-    // Create event emitter for queue notifications
-    const emitter = new EventEmitter();
-    this.sessionQueues.set(sessionDbId, emitter);
 
     logger.info('SESSION', 'Session initialized', {
       sessionId: sessionDbId,
@@ -185,319 +399,485 @@ export class SessionManager {
     return session;
   }
 
-  /**
-   * Get active session by ID
-   */
   getSession(sessionDbId: number): ActiveSession | undefined {
     return this.sessions.get(sessionDbId);
   }
 
+  isSessionDeleting(sessionDbId: number): boolean {
+    return this.deletingSessions.has(sessionDbId);
+  }
+
+  private deliverSessionWrapupInBackground(sessionDbId: number): void {
+    const formatSummary = this.telegramWrapupFormatter;
+    if (!formatSummary) {
+      logger.warn('TELEGRAM', 'Telegram session wrap-up formatter is unavailable', {
+        sessionId: sessionDbId,
+      });
+      return;
+    }
+
+    void deliverSessionWrapup({
+      sessionStore: this.dbManager.getSessionStore(),
+      sessionDbId,
+      formatSummary,
+    }).catch((error: unknown) => {
+      logger.warn('TELEGRAM', 'Failed to deliver Telegram session wrap-up from SessionManager', {
+        sessionId: sessionDbId,
+      }, error instanceof Error ? error : new Error(String(error)));
+    });
+  }
+
+  private takeRequestedSessionWrapup(session: ActiveSession): boolean {
+    if (session.telegramWrapupTimer != null) {
+      clearTimeout(session.telegramWrapupTimer);
+      session.telegramWrapupTimer = null;
+    }
+
+    return session.telegramWrapupRequestedAt != null;
+  }
+
+  /** SessionEnd is the sole producer of this marker; Stop only queues a summary. */
+  async requestSessionWrapup(sessionDbId: number): Promise<void> {
+    const session = this.getSession(sessionDbId);
+    if (!session) {
+      this.deliverSessionWrapupInBackground(sessionDbId);
+      return;
+    }
+
+    session.telegramWrapupRequestedAt = Date.now();
+    if (session.telegramWrapupTimer != null) {
+      clearTimeout(session.telegramWrapupTimer);
+    }
+    session.telegramWrapupTimer = setTimeout(() => {
+      session.telegramWrapupTimer = null;
+      this.deliverSessionWrapupInBackground(sessionDbId);
+    }, SESSION_END_WRAPUP_GRACE_MS);
+    session.telegramWrapupTimer.unref?.();
+  }
+
+  /** Called after a summary write; the SessionEnd marker preserves Stop-only silence. */
+  deliverRequestedSessionWrapup(sessionDbId: number): void {
+    const session = this.getSession(sessionDbId);
+    if (session?.telegramWrapupRequestedAt == null) {
+      return;
+    }
+    this.deliverSessionWrapupInBackground(sessionDbId);
+  }
+
   /**
-   * Queue an observation for processing (zero-latency notification)
-   * Auto-initializes session if not in memory but exists in database
-   *
-   * CRITICAL: Persists to database FIRST before adding to in-memory queue.
-   * This ensures observations survive worker crashes.
+   * Synchronous on purpose: when this returns the message is in the buffer,
+   * so ingest can record the hook-spool hand-off before any await (and before
+   * the generator kick) — see HookSpool.drain.
    */
-  queueObservation(sessionDbId: number, data: ObservationData): void {
-    // Auto-initialize from database if needed (handles worker restarts)
+  queueObservation(sessionDbId: number, data: ObservationData, enqueuedAtEpochMs?: number): void {
     let session = this.sessions.get(sessionDbId);
     if (!session) {
       session = this.initializeSession(sessionDbId);
     }
 
-    // CRITICAL: Persist to database FIRST
     const message: PendingMessage = {
       type: 'observation',
       tool_name: data.tool_name,
       tool_input: data.tool_input,
       tool_response: data.tool_response,
       prompt_number: data.prompt_number,
-      cwd: data.cwd
+      cwd: data.cwd,
+      agentId: data.agentId,
+      agentType: data.agentType,
+      toolUseId: data.toolUseId,
     };
 
-    try {
-      const messageId = this.getPendingStore().enqueue(sessionDbId, session.contentSessionId, message);
-      const queueDepth = this.getPendingStore().getPendingCount(sessionDbId);
-      const toolSummary = logger.formatTool(data.tool_name, data.tool_input);
+    const messageId = this.buffer.enqueue(sessionDbId, message, enqueuedAtEpochMs);
+    const queueDepth = this.buffer.getPendingCount(sessionDbId);
+    const toolSummary = redactForLog(logger.formatTool(data.tool_name, data.tool_input));
+    if (messageId === 0) {
+      logger.debug('QUEUE', `DUP_SUPPRESSED | sessionDbId=${sessionDbId} | type=observation | tool=${toolSummary} | toolUseId=${data.toolUseId ?? 'null'} | depth=${queueDepth}`, {
+        sessionId: sessionDbId
+      });
+    } else {
       logger.info('QUEUE', `ENQUEUED | sessionDbId=${sessionDbId} | messageId=${messageId} | type=observation | tool=${toolSummary} | depth=${queueDepth}`, {
         sessionId: sessionDbId
       });
-    } catch (error) {
-      logger.error('SESSION', 'Failed to persist observation to DB', {
-        sessionId: sessionDbId,
-        tool: data.tool_name
-      }, error);
-      throw error; // Don't continue if we can't persist
     }
-
-    // Notify generator immediately (zero latency)
-    const emitter = this.sessionQueues.get(sessionDbId);
-    emitter?.emit('message');
   }
 
-  /**
-   * Queue a summarize request (zero-latency notification)
-   * Auto-initializes session if not in memory but exists in database
-   *
-   * CRITICAL: Persists to database FIRST before adding to in-memory queue.
-   * This ensures summarize requests survive worker crashes.
-   */
-  queueSummarize(sessionDbId: number, lastAssistantMessage?: string): void {
-    // Auto-initialize from database if needed (handles worker restarts)
+  /** Synchronous on purpose — see queueObservation. */
+  queueSummarize(
+    sessionDbId: number,
+    lastAssistantMessage?: string,
+    promptNumber?: number,
+    enqueuedAtEpochMs?: number,
+  ): void {
     let session = this.sessions.get(sessionDbId);
     if (!session) {
       session = this.initializeSession(sessionDbId);
     }
 
-    // CRITICAL: Persist to database FIRST
     const message: PendingMessage = {
       type: 'summarize',
+      prompt_number: promptNumber ?? session.lastPromptNumber,
       last_assistant_message: lastAssistantMessage
     };
 
-    try {
-      const messageId = this.getPendingStore().enqueue(sessionDbId, session.contentSessionId, message);
-      const queueDepth = this.getPendingStore().getPendingCount(sessionDbId);
+    const messageId = this.buffer.enqueue(sessionDbId, message, enqueuedAtEpochMs);
+    const queueDepth = this.buffer.getPendingCount(sessionDbId);
+    if (messageId === 0) {
+      logger.debug('QUEUE', `DUP_SUPPRESSED | sessionDbId=${sessionDbId} | type=summarize | depth=${queueDepth}`, {
+        sessionId: sessionDbId
+      });
+    } else {
       logger.info('QUEUE', `ENQUEUED | sessionDbId=${sessionDbId} | messageId=${messageId} | type=summarize | depth=${queueDepth}`, {
         sessionId: sessionDbId
       });
-    } catch (error) {
-      logger.error('SESSION', 'Failed to persist summarize to DB', {
-        sessionId: sessionDbId
-      }, error);
-      throw error; // Don't continue if we can't persist
     }
-
-    const emitter = this.sessionQueues.get(sessionDbId);
-    emitter?.emit('message');
   }
 
-  /**
-   * Delete a session (abort SDK agent and cleanup)
-   * Verifies subprocess exit to prevent zombie process accumulation (Issue #737)
-   */
+  async clearPendingForSession(sessionDbId: number): Promise<number> {
+    return this.buffer.clear(sessionDbId);
+  }
+
+  async resetProcessingToPending(sessionDbId: number): Promise<number> {
+    const session = this.sessions.get(sessionDbId);
+    if (session) {
+      session.claimedMessageIds = [];
+    }
+    return this.buffer.resetClaimed(sessionDbId);
+  }
+
+  async confirmClaimedMessages(sessionDbId: number): Promise<number> {
+    const session = this.sessions.get(sessionDbId);
+    const claimedIds = session?.claimedMessageIds ?? [];
+    let confirmed = 0;
+    for (const messageId of claimedIds) {
+      confirmed += this.buffer.confirm(messageId);
+    }
+    if (session) {
+      session.claimedMessageIds = [];
+      session.earliestPendingTimestamp = null;
+    }
+    if (confirmed > 0) {
+      const state = this.transportResumes.get(sessionDbId);
+      if (state?.timer) this.transportResumeClock.clearTimeout(state.timer);
+      if (state) {
+        state.timer = undefined;
+        state.pauses = 0;
+      }
+      // The generator can remain alive for its idle window after draining
+      // queued work. Free the shared probe slot as soon as it is done sending.
+      if (this.buffer.getPendingCount(sessionDbId) === 0) this.clearTransportResume(sessionDbId);
+    }
+    return confirmed;
+  }
+
+  getClaimedMessages(sessionDbId: number): PendingMessageWithId[] {
+    const session = this.sessions.get(sessionDbId);
+    const claimedIds = session?.claimedMessageIds ?? [];
+    return this.buffer.getMessagesByIds(sessionDbId, claimedIds);
+  }
+
   async deleteSession(sessionDbId: number): Promise<void> {
     const session = this.sessions.get(sessionDbId);
-    if (!session) {
-      return; // Already deleted
+    if (!session || this.deletingSessions.has(sessionDbId)) {
+      return;
     }
-
-    const sessionDuration = Date.now() - session.startTime;
-
-    // 1. Abort the SDK agent
-    session.abortController.abort();
-
-    // 2. Wait for generator to finish (with 30s timeout to prevent stale stall, Issue #1099)
-    if (session.generatorPromise) {
-      const generatorDone = session.generatorPromise.catch(() => {
-        logger.debug('SYSTEM', 'Generator already failed, cleaning up', { sessionId: session.sessionDbId });
-      });
-      const timeoutDone = new Promise<void>(resolve => {
-        AbortSignal.timeout(30_000).addEventListener('abort', () => resolve(), { once: true });
-      });
-      await Promise.race([generatorDone, timeoutDone]).then(() => {}, () => {
-        logger.warn('SESSION', 'Generator did not exit within 30s after abort, forcing cleanup (#1099)', { sessionDbId });
-      });
-    }
-
-    // 3. Verify subprocess exit with 5s timeout (Issue #737 fix)
-    const tracked = getProcessBySession(sessionDbId);
-    if (tracked && tracked.process.exitCode === null) {
-      logger.debug('SESSION', `Waiting for subprocess PID ${tracked.pid} to exit`, {
-        sessionId: sessionDbId,
-        pid: tracked.pid
-      });
-      await ensureProcessExit(tracked, 5000);
-    }
-
-    // 3b. Reap all supervisor-tracked processes for this session (#1351)
-    // This catches MCP servers and other child processes not tracked by the
-    // in-memory ProcessRegistry (e.g. processes registered only in supervisor.json).
+    const priorTransportPauses = this.transportResumes.get(sessionDbId)?.pauses;
+    const priorAbortCategory = (session.abortReason ?? '').split(':')[0];
+    let dispositionEpoch: number | undefined;
+    // Fence delayed transport callbacks before the async teardown can yield.
+    this.deletingSessions.add(sessionDbId);
     try {
-      await getSupervisor().getRegistry().reapSession(sessionDbId);
-    } catch (error) {
-      logger.warn('SESSION', 'Supervisor reapSession failed (non-blocking)', {
-        sessionId: sessionDbId
-      }, error as Error);
-    }
+      this.clearTransportResume(sessionDbId);
+      dispositionEpoch = this.transportResumeDispositionEpochs.get(session);
 
-    // 4. Cleanup
-    this.sessions.delete(sessionDbId);
-    this.sessionQueues.delete(sessionDbId);
+      // Phase 2: emit this session's single observer_turn_rollup at session end,
+      // while the session still exists. flushSession removes the bucket, so the
+      // matching call in removeSessionImmediate (or a re-entry here) is a safe
+      // no-op. Never throws — telemetry is fire-and-forget.
+      telemetryBuffer.flushSession(sessionDbId, 'session_end');
 
-    logger.info('SESSION', 'Session deleted', {
-      sessionId: sessionDbId,
-      duration: `${(sessionDuration / 1000).toFixed(1)}s`,
-      project: session.project
-    });
+      const sessionDuration = Date.now() - session.startTime;
 
-    // Trigger callback to broadcast status update (spinner may need to stop)
-    if (this.onSessionDeletedCallback) {
-      this.onSessionDeletedCallback();
+      if (session.respawnTimer) {
+        clearTimeout(session.respawnTimer);
+        session.respawnTimer = undefined;
+      }
+
+      session.abortReason = 'shutdown';
+      session.abortController.abort();
+
+      if (session.generatorPromise) {
+        const generatorDone = session.generatorPromise.catch(() => {
+          logger.debug('SYSTEM', 'Generator already failed, cleaning up', { sessionId: session.sessionDbId });
+        });
+        const timeoutDone = new Promise<void>(resolve => {
+          AbortSignal.timeout(30_000).addEventListener('abort', () => resolve(), { once: true });
+        });
+        await Promise.race([generatorDone, timeoutDone]).then(() => {}, () => {
+          logger.warn('SESSION', 'Generator did not exit within 30s after abort, forcing cleanup (#1099)', { sessionDbId });
+        });
+      }
+
+      const tracked = getSdkProcessForSession(sessionDbId);
+      if (tracked && tracked.process.exitCode === null) {
+        logger.debug('SESSION', `Waiting for subprocess PID ${tracked.pid} (pgid ${tracked.pgid}) to exit`, {
+          sessionId: sessionDbId,
+          pid: tracked.pid,
+          pgid: tracked.pgid
+        });
+        await ensureSdkProcessExit(tracked, 5000);
+      }
+
+      try {
+        await getSupervisor().getRegistry().reapSession(sessionDbId);
+      } catch (error) {
+        if (error instanceof Error) {
+          logger.warn('SESSION', 'Supervisor reapSession failed (non-blocking)', {
+            sessionId: sessionDbId
+          }, error);
+        } else {
+          logger.warn('SESSION', 'Supervisor reapSession failed (non-blocking) with non-Error', {
+            sessionId: sessionDbId
+          }, new Error(String(error)));
+        }
+      }
+
+      if (this.takeRequestedSessionWrapup(session)) {
+        this.deliverSessionWrapupInBackground(sessionDbId);
+      }
+      this.clearTransportResume(sessionDbId);
+      this.logParkedMessagesEndingWithSession(sessionDbId);
+      this.disposeSessionBuffer(sessionDbId);
+      this.summarizeRescues.delete(sessionDbId);
+      this.sessions.delete(sessionDbId);
+      logger.info('SESSION', 'Session deleted', {
+        sessionId: sessionDbId,
+        duration: `${(sessionDuration / 1000).toFixed(1)}s`,
+        project: session.project
+      });
+    } finally {
+      // A teardown failure leaves the session and its buffered work alive.
+      // Release the deletion fence and restore only a pre-existing transport
+      // pause; quota/auth pauses must continue to wait for their own trigger.
+      const stillCurrent = this.sessions.get(sessionDbId) === session;
+      const currentAbortCategory = (session.abortReason ?? '').split(':')[0];
+      if (stillCurrent && session.abortReason === 'shutdown') session.abortReason = null;
+      this.deletingSessions.delete(sessionDbId);
+      if (stillCurrent && priorTransportPauses !== undefined
+        && dispositionEpoch !== undefined
+        && this.transportResumeDispositionEpochs.get(session) === dispositionEpoch
+        && !['quota', 'auth', 'overflow', 'provider_switch'].includes(priorAbortCategory)
+        && !['quota', 'auth', 'overflow', 'provider_switch'].includes(currentAbortCategory)
+        && !this.transportResumes.has(sessionDbId) && this.buffer.getPendingCount(sessionDbId) > 0) {
+        // scheduleTransportResume increments pauses; retain the original
+        // backoff position rather than treating teardown as a new failure.
+        this.transportResumes.set(sessionDbId, { pauses: Math.max(0, priorTransportPauses - 1) });
+        try {
+          this.scheduleTransportResume(sessionDbId);
+        } catch (error) {
+          this.transportResumes.delete(sessionDbId);
+          logger.error('SESSION', 'Failed to restore transport resume after teardown error', { sessionId: sessionDbId },
+            error instanceof Error ? error : new Error(String(error)));
+        }
+      }
     }
   }
 
-  /**
-   * Remove session from in-memory maps and notify without awaiting generator.
-   * Used when SDK resume fails and we give up (no fallback): avoids deadlock
-   * from deleteSession() awaiting the same generator promise we're inside.
-   */
   removeSessionImmediate(sessionDbId: number): void {
     const session = this.sessions.get(sessionDbId);
     if (!session) return;
 
-    this.sessions.delete(sessionDbId);
-    this.sessionQueues.delete(sessionDbId);
+    // Phase 2: same session-end rollup as deleteSession. Whichever teardown
+    // path runs first flushes; flushSession removes the bucket so the second is
+    // a no-op (guards against the deleteSession/removeSessionImmediate pair).
+    telemetryBuffer.flushSession(sessionDbId, 'session_end');
 
-    logger.info('SESSION', 'Session removed (orphaned after SDK termination)', {
+    if (session.respawnTimer) {
+      clearTimeout(session.respawnTimer);
+      session.respawnTimer = undefined;
+    }
+
+    if (this.takeRequestedSessionWrapup(session)) {
+      this.deliverSessionWrapupInBackground(sessionDbId);
+    }
+
+    this.clearTransportResume(sessionDbId);
+    this.logParkedMessagesEndingWithSession(sessionDbId);
+    this.disposeSessionBuffer(sessionDbId);
+    this.summarizeRescues.delete(sessionDbId);
+    this.sessions.delete(sessionDbId);
+    logger.info('SESSION', 'Session removed from active sessions', {
       sessionId: sessionDbId,
       project: session.project
     });
-
-    if (this.onSessionDeletedCallback) {
-      this.onSessionDeletedCallback();
-    }
   }
 
-  private static readonly MAX_SESSION_IDLE_MS = 15 * 60 * 1000; // 15 minutes
-
-  /**
-   * Reap sessions with no active generator and no pending work that have been idle too long.
-   * This unblocks the orphan reaper which skips processes for "active" sessions. (Issue #1168)
-   */
-  async reapStaleSessions(): Promise<number> {
-    const now = Date.now();
-    const staleSessionIds: number[] = [];
-
-    for (const [sessionDbId, session] of this.sessions) {
-      // Skip sessions with active generators
-      if (session.generatorPromise) continue;
-
-      // Skip sessions with pending work
-      const pendingCount = this.getPendingStore().getPendingCount(sessionDbId);
-      if (pendingCount > 0) continue;
-
-      // No generator + no pending work + old enough = stale
-      const sessionAge = now - session.startTime;
-      if (sessionAge > SessionManager.MAX_SESSION_IDLE_MS) {
-        staleSessionIds.push(sessionDbId);
-      }
-    }
-
-    for (const sessionDbId of staleSessionIds) {
-      logger.warn('SESSION', `Reaping stale session ${sessionDbId} (no activity for >${Math.round(SessionManager.MAX_SESSION_IDLE_MS / 60000)}m)`, { sessionDbId });
-      await this.deleteSession(sessionDbId);
-    }
-
-    return staleSessionIds.length;
+  /** Parked batches end with their session like the rest of the RAM buffer; say so rather than drop them silently. */
+  private logParkedMessagesEndingWithSession(sessionDbId: number): void {
+    const parkedMessages = this.buffer.getParkedMessages(sessionDbId);
+    if (parkedMessages.length === 0) return;
+    logger.warn('SESSION', 'Session ended with parked batches; they were never resent', {
+      sessionId: sessionDbId,
+      parkedMessageIds: parkedMessages.map(parked => parked.messageId),
+      clientAttemptIds: [...new Set(parkedMessages.map(parked => parked.clientAttemptId))],
+    });
   }
 
-  /**
-   * Shutdown all active sessions
-   */
+  private disposeSessionBuffer(sessionDbId: number): void {
+    const pendingCount = this.buffer.getPendingCount(sessionDbId);
+    if (pendingCount > 0) {
+      logger.warn('SESSION', 'Discarding pending session messages', {
+        sessionId: sessionDbId,
+        pendingCount,
+      });
+    }
+    this.buffer.dispose(sessionDbId);
+  }
+
   async shutdownAll(): Promise<void> {
     const sessionIds = Array.from(this.sessions.keys());
+    const pendingCountAtShutdownStart = sessionIds.reduce((total, id) => total + this.buffer.getPendingCount(id), 0);
+    if (pendingCountAtShutdownStart > 0) {
+      logger.warn('SESSION', 'Worker shutdown starting with pending session messages', {
+        pendingCountAtShutdownStart,
+      });
+    }
     await Promise.all(sessionIds.map(id => this.deleteSession(id)));
   }
 
-  /**
-   * Check if any session has pending messages (for spinner tracking)
-   */
-  hasPendingMessages(): boolean {
-    return this.getPendingStore().hasAnyPendingWork();
-  }
-
-  /**
-   * Get number of active sessions (for stats)
-   */
   getActiveSessionCount(): number {
     return this.sessions.size;
   }
 
   /**
-   * Get total queue depth across all sessions (for activity indicator)
+   * True when any in-memory session saw message/generator activity at or
+   * after the cutoff — the idle-exit monitor's session signal.
+   *
+   * Deliberately NOT a session count: a session that merely EXISTS is not
+   * activity. A standing memory seat registered at boot (Grok Bot awareness
+   * registers one), or a session idling between prompts, would hold
+   * `sessions.size` above zero for the life of the worker and make the
+   * worker permanently un-idleable. lastGeneratorActivity is stamped at
+   * session creation and refreshed as the generator drains messages, so this
+   * answers "did any session do work recently?" instead of "are any sessions
+   * registered?". Queued-but-unprocessed work is a separate signal
+   * (getTotalQueueDepth).
+   *
+   * A running generator is activity however old its last message: it may be
+   * waiting on an observer reply with nothing left in the buffer (the
+   * bare-prompt init turn). It cannot pin the worker awake for long, since a
+   * generator with no messages ends after IDLE_TIMEOUT_MS (3 min).
    */
-  getTotalQueueDepth(): number {
-    let total = 0;
-    // We can iterate over active sessions to get their pending count
+  hasSessionActivitySince(cutoffMs: number): boolean {
     for (const session of this.sessions.values()) {
-      total += this.getPendingStore().getPendingCount(session.sessionDbId);
+      if (session.generatorPromise || session.lastGeneratorActivity >= cutoffMs) return true;
     }
-    return total;
+    return false;
   }
 
   /**
-   * Get total active work (queued + currently processing)
-   * Counts both pending messages and items actively being processed by SDK agents
+   * Snapshot paused in-memory work without loading sessions or changing the buffer.
+   * The automatic sweep resumes only pauses that time heals, each paced or
+   * capped where it is armed. A rate-limit pause is retried like a quota pause:
+   * the breaker it armed paces it. The sweep leaves a session to a resume it
+   * scheduled for itself, too: a rate limit must not be retried before its
+   * Retry-After. With memory on the cmem gateway, a session whose unattended
+   * resumes are spent is left for its next hook as well: the sweep is one more
+   * unattended retry, and letting it through would make that budget meaningless.
+   *
+   * It leaves out pauses that a retry on a timer cannot heal. Each one waits
+   * for the next captured event or an operator retry (`POST /api/processing`)
+   * until the per-reason resume scheduler gives it a bounded retry:
+   *  - a setup failure (`setup_required`), until the Claude CLI or the data
+   *    directory is repaired. The start gate rechecks it on the next event;
+   *  - an observer that spent its overflow recycles (`overflowPausedUntilMs`):
+   *    a message that fits no generation aborts again on every retry, which
+   *    the sweep repeated every cooldown, forever.
    */
-  getTotalActiveWork(): number {
-    // getPendingCount includes 'processing' status, so this IS the total active work
+  getResumableSessionIds(includeOperatorOnly: boolean = false): number[] {
+    const automaticallyRetryable = new Set([null, undefined, 'quota', 'rate_limit', 'overflow', 'provider_switch', 'response_stall']);
+    const memoryOnCmemGateway = !includeOperatorOnly && canCmemGatewayServe();
+    return Array.from(this.sessions.values())
+      .filter(session => !session.generatorPromise
+        && this.buffer.getPendingCount(session.sessionDbId) > 0
+        && (includeOperatorOnly || !(session.pausedReason === 'response_stall' && session.stallResumeTimer !== undefined))
+        && (includeOperatorOnly || session.overflowPausedUntilMs === undefined)
+        && (includeOperatorOnly || session.scheduledResumeTimer === undefined)
+        && (includeOperatorOnly || !(memoryOnCmemGateway && unattendedGatewayResumesSpent(session)))
+        && (includeOperatorOnly || automaticallyRetryable.has(session.pausedReason)))
+      .map(session => session.sessionDbId);
+  }
+
+  getTotalQueueDepth(): number {
+    return this.buffer.getTotalDepth();
+  }
+
+  async getTotalActiveWork(): Promise<number> {
     return this.getTotalQueueDepth();
   }
 
-  /**
-   * Check if any session is actively processing (has pending messages OR active generator)
-   * Used for activity indicator to prevent spinner from stopping while SDK is processing
-   */
-  isAnySessionProcessing(): boolean {
-    // hasAnyPendingWork checks for 'pending' OR 'processing'
-    return this.getPendingStore().hasAnyPendingWork();
+  async isAnySessionProcessing(): Promise<boolean> {
+    return this.getTotalQueueDepth() > 0;
   }
 
-  /**
-   * Get message iterator for SDKAgent to consume (event-driven, no polling)
-   * Auto-initializes session if not in memory but exists in database
-   *
-   * CRITICAL: Uses PendingMessageStore for crash-safe message persistence.
-   * Messages are marked as 'processing' when yielded and must be marked 'processed'
-   * by the SDK agent after successful completion.
-   */
   async *getMessageIterator(sessionDbId: number): AsyncIterableIterator<PendingMessageWithId> {
-    // Auto-initialize from database if needed (handles worker restarts)
     let session = this.sessions.get(sessionDbId);
     if (!session) {
       session = this.initializeSession(sessionDbId);
     }
 
-    const emitter = this.sessionQueues.get(sessionDbId);
-    if (!emitter) {
-      throw new Error(`No emitter for session ${sessionDbId}`);
-    }
+    // Re-yield anything a prior generator pass claimed but did not confirm.
+    await this.resetProcessingToPending(sessionDbId);
 
-    const processor = new SessionQueueProcessor(this.getPendingStore(), emitter);
-
-    // Use the robust iterator - messages are deleted on claim (no tracking needed)
-    // CRITICAL: Pass onIdleTimeout callback that triggers abort to kill the subprocess
-    // Without this, the iterator returns but the Claude subprocess stays alive as a zombie
-    for await (const message of processor.createIterator({
+    for await (const message of this.buffer.drain({
       sessionDbId,
       signal: session.abortController.signal,
       onIdleTimeout: () => {
         logger.info('SESSION', 'Triggering abort due to idle timeout to kill subprocess', { sessionDbId });
         session.idleTimedOut = true;
+        session.abortReason = 'idle';
         session.abortController.abort();
       }
     })) {
-      // Track earliest timestamp for accurate observation timestamps
-      // This ensures backlog messages get their original timestamps, not current time
+      session.claimedMessageIds.push(message._persistentId);
       if (session.earliestPendingTimestamp === null) {
         session.earliestPendingTimestamp = message._originalTimestamp;
       } else {
         session.earliestPendingTimestamp = Math.min(session.earliestPendingTimestamp, message._originalTimestamp);
       }
 
-      // Update generator activity for stale detection (Issue #1099)
       session.lastGeneratorActivity = Date.now();
 
       yield message;
     }
   }
 
-  /**
-   * Get the PendingMessageStore (for SDKAgent to mark messages as processed)
-   */
-  getPendingMessageStore(): PendingMessageStore {
-    return this.getPendingStore();
+  /** Extend the current request without advancing the asynchronous iterator. */
+  claimNextObservation(sessionDbId: number, accepts: (message: PendingMessageWithId) => boolean): PendingMessageWithId | null {
+    const session = this.sessions.get(sessionDbId);
+    if (!session || session.abortController.signal.aborted) return null;
+    const message = this.buffer.claimNextMatching(sessionDbId,
+      candidate => candidate.type === 'observation' && accepts(candidate));
+    if (message) {
+      session.claimedMessageIds.push(message._persistentId);
+      session.earliestPendingTimestamp = Math.min(session.earliestPendingTimestamp ?? message._originalTimestamp, message._originalTimestamp);
+    }
+    return message;
+  }
+
+  /** Read-only access to the in-RAM buffer for diagnostics. */
+  /** Whether a summarize is buffered for this session, claimed or not. */
+  hasPendingSummarize(sessionDbId: number): boolean {
+    return this.buffer.peekTypes(sessionDbId).some(message => message.message_type === 'summarize');
+  }
+
+  /** Take this session's one summarize rescue; false once it has been used. */
+  claimSummarizeRescue(sessionDbId: number): boolean {
+    if (this.summarizeRescues.has(sessionDbId)) return false;
+    this.summarizeRescues.add(sessionDbId);
+    return true;
+  }
+
+  getMessageBuffer(): SessionMessageBuffer {
+    return this.buffer;
   }
 }

@@ -1,80 +1,7 @@
 import { describe, it, expect } from 'bun:test';
+import { logger } from '../../src/utils/logger.js';
 
-/**
- * Direct implementation of formatTool for testing
- * This avoids Bun's mock.module() pollution from parallel tests
- * The logic is identical to Logger.formatTool in src/utils/logger.ts
- */
-function formatTool(toolName: string, toolInput?: any): string {
-  if (!toolInput) return toolName;
-
-  let input = toolInput;
-  if (typeof toolInput === 'string') {
-    try {
-      input = JSON.parse(toolInput);
-    } catch {
-      // Input is a raw string (e.g., Bash command), use as-is
-      input = toolInput;
-    }
-  }
-
-  // Bash: show full command
-  if (toolName === 'Bash' && input.command) {
-    return `${toolName}(${input.command})`;
-  }
-
-  // File operations: show full path
-  if (input.file_path) {
-    return `${toolName}(${input.file_path})`;
-  }
-
-  // NotebookEdit: show full notebook path
-  if (input.notebook_path) {
-    return `${toolName}(${input.notebook_path})`;
-  }
-
-  // Glob: show full pattern
-  if (toolName === 'Glob' && input.pattern) {
-    return `${toolName}(${input.pattern})`;
-  }
-
-  // Grep: show full pattern
-  if (toolName === 'Grep' && input.pattern) {
-    return `${toolName}(${input.pattern})`;
-  }
-
-  // WebFetch/WebSearch: show full URL or query
-  if (input.url) {
-    return `${toolName}(${input.url})`;
-  }
-
-  if (input.query) {
-    return `${toolName}(${input.query})`;
-  }
-
-  // Task: show subagent_type or full description
-  if (toolName === 'Task') {
-    if (input.subagent_type) {
-      return `${toolName}(${input.subagent_type})`;
-    }
-    if (input.description) {
-      return `${toolName}(${input.description})`;
-    }
-  }
-
-  // Skill: show skill name
-  if (toolName === 'Skill' && input.skill) {
-    return `${toolName}(${input.skill})`;
-  }
-
-  // LSP: show operation type
-  if (toolName === 'LSP' && input.operation) {
-    return `${toolName}(${input.operation})`;
-  }
-
-  // Default: just show tool name
-  return toolName;
-}
+const formatTool = (toolName: string, toolInput?: any): string => logger.formatTool(toolName, toolInput);
 
 describe('logger.formatTool()', () => {
   describe('Valid JSON string input', () => {
@@ -101,9 +28,7 @@ describe('logger.formatTool()', () => {
 
   describe('Raw non-JSON string input (Issue #545 bug fix)', () => {
     it('should handle raw command string without crashing', () => {
-      // This was the bug: raw strings caused JSON.parse to throw
       const result = formatTool('Bash', 'raw command string');
-      // Since it's not JSON, it should just return the tool name
       expect(result).toBe('Bash');
     });
 
@@ -119,7 +44,6 @@ describe('logger.formatTool()', () => {
 
     it('should handle empty string input', () => {
       const result = formatTool('Bash', '');
-      // Empty string is falsy, so returns just the tool name early
       expect(result).toBe('Bash');
     });
 
@@ -193,13 +117,11 @@ describe('logger.formatTool()', () => {
     });
 
     it('should return just tool name when toolInput is 0', () => {
-      // 0 is falsy
       const result = formatTool('Task', 0);
       expect(result).toBe('Task');
     });
 
     it('should return just tool name when toolInput is false', () => {
-      // false is falsy
       const result = formatTool('Task', false);
       expect(result).toBe('Task');
     });
@@ -337,19 +259,16 @@ describe('logger.formatTool()', () => {
       });
 
       it('should extract url from unknown tools if present', () => {
-        // url is a generic extractor
         const result = formatTool('CustomFetch', { url: 'https://api.custom.com' });
         expect(result).toBe('CustomFetch(https://api.custom.com)');
       });
 
       it('should extract query from unknown tools if present', () => {
-        // query is a generic extractor
         const result = formatTool('CustomSearch', { query: 'find something' });
         expect(result).toBe('CustomSearch(find something)');
       });
 
       it('should extract file_path from unknown tools if present', () => {
-        // file_path is a generic extractor
         const result = formatTool('CustomFileTool', { file_path: '/some/path.txt' });
         expect(result).toBe('CustomFileTool(/some/path.txt)');
       });
@@ -390,22 +309,98 @@ describe('logger.formatTool()', () => {
     });
 
     it('should handle number values in fields correctly', () => {
-      // If command is a number, it gets stringified
       const result = formatTool('Bash', { command: 123 });
       expect(result).toBe('Bash(123)');
     });
 
     it('should handle JSON array as input', () => {
-      // Arrays don't have command/file_path/etc fields
       const result = formatTool('Unknown', ['item1', 'item2']);
       expect(result).toBe('Unknown');
     });
 
     it('should handle JSON string that parses to a primitive', () => {
-      // JSON.parse("123") = 123 (number)
       const result = formatTool('Task', '"a plain string"');
-      // After parsing, input becomes "a plain string" which has no recognized fields
       expect(result).toBe('Task');
     });
   });
+});
+
+// safeStringify is the depth-guarded serializer the DEBUG log path uses instead
+// of a plain JSON.stringify, which overflows the stack on deeply nested or
+// self-referential payloads ("RangeError: Maximum call stack size exceeded").
+const safeStringify = (data: unknown, indent?: number): string =>
+  (logger as any).safeStringify(data, indent);
+
+describe('logger.safeStringify()', () => {
+  it('serializes ordinary objects like JSON.stringify', () => {
+    expect(safeStringify({ a: 1, b: 'x' })).toBe(JSON.stringify({ a: 1, b: 'x' }));
+    expect(safeStringify({ a: 1 }, 2)).toBe(JSON.stringify({ a: 1 }, null, 2));
+  });
+
+  it('truncates a nested object past the depth cap instead of recursing into it', () => {
+    // Depth far beyond the serializer's cap: prune stops early, so it never
+    // walks the whole chain (which is how a plain JSON.stringify overflows).
+    let deep: any = {};
+    let cursor = deep;
+    for (let i = 0; i < 50; i++) {
+      cursor.next = {};
+      cursor = cursor.next;
+    }
+    let out = '';
+    expect(() => { out = safeStringify(deep, 2); }).not.toThrow();
+    expect(out).toContain('[Object]'); // truncated past the depth cap
+  });
+
+  it('truncates a nested array past the depth cap', () => {
+    let arr: any = [];
+    let cursor = arr;
+    for (let i = 0; i < 50; i++) {
+      const child: any[] = [];
+      cursor.push(child);
+      cursor = child;
+    }
+    let out = '';
+    expect(() => { out = safeStringify(arr, 2); }).not.toThrow();
+    expect(out).toContain('[Array]');
+  });
+
+  it('handles self-referential (circular) structures', () => {
+    const cyclic: any = { name: 'root' };
+    cyclic.self = cyclic;
+    let out = '';
+    expect(() => { out = safeStringify(cyclic, 2); }).not.toThrow();
+    expect(out).toContain('[Circular]');
+    expect(out).toContain('root');
+  });
+
+  it('handles BigInt without throwing', () => {
+    let out = '';
+    expect(() => { out = safeStringify({ big: 10n }); }).not.toThrow();
+    expect(out).toContain('10n');
+  });
+
+  it('serializes toJSON values (Date, URL) the way JSON.stringify does, not as {}', () => {
+    const payload = { at: new Date(0), url: new URL('https://example.com/a?b=1') };
+    expect(safeStringify(payload)).toBe(JSON.stringify(payload));
+  });
+
+  it('survives a throwing getter', () => {
+    const obj = {
+      get boom(): string { throw new Error('nope'); },
+      ok: 1,
+    };
+    let out = '';
+    expect(() => { out = safeStringify(obj); }).not.toThrow();
+    expect(out).toContain('[unreadable]');
+    expect(out).toContain('"ok":1');
+  });
+});
+
+describe('logger.formatTool() parsed null input', () => {
+  for (const toolName of ['Bash', 'Read', 'mcp__fixture__no_args']) {
+    it(`formats JSON null for ${toolName} as no arguments`, () => {
+      expect(formatTool(toolName, 'null')).toBe(toolName);
+      expect(formatTool(toolName, '  null  ')).toBe(toolName);
+    });
+  }
 });

@@ -1,0 +1,538 @@
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
+import { Database } from 'bun:sqlite';
+import { Server, type ServerOptions } from '../../src/services/server/Server.js';
+import { ServerV1Routes } from '../../src/server/routes/v1/ServerV1Routes.js';
+import { createServerApiKey } from '../../src/server/auth/sqlite-api-key-service.js';
+import { logger } from '../../src/utils/logger.js';
+
+let loggerSpies: ReturnType<typeof spyOn>[] = [];
+
+describe('server REST API v1 routes', () => {
+  let db: Database;
+  let server: Server;
+  let port: number;
+
+  beforeEach(async () => {
+    loggerSpies = [
+      spyOn(logger, 'info').mockImplementation(() => {}),
+      spyOn(logger, 'debug').mockImplementation(() => {}),
+      spyOn(logger, 'warn').mockImplementation(() => {}),
+      spyOn(logger, 'error').mockImplementation(() => {}),
+    ];
+    db = new Database(':memory:');
+    db.run('PRAGMA foreign_keys = ON');
+    const options: ServerOptions = {
+      getInitializationComplete: () => true,
+      getMcpReady: () => true,
+      onShutdown: mock(() => Promise.resolve()),
+      onRestart: mock(() => Promise.resolve()),
+      workerPath: '/test/worker-service.cjs',
+      getAiStatus: () => ({
+        provider: 'claude',
+        authMethod: 'cli',
+        lastInteraction: null,
+      }),
+    };
+    server = new Server(options);
+    server.registerRoutes(new ServerV1Routes({
+      getDatabase: () => db,
+      authMode: 'local-dev',
+      allowLocalDevBypass: true,
+    }));
+    server.finalizeRoutes();
+    await server.listen(0, '127.0.0.1');
+    const address = server.getHttpServer()?.address();
+    if (!address || typeof address === 'string') {
+      throw new Error('Expected server to bind to an ephemeral TCP port');
+    }
+    port = address.port;
+  });
+
+  afterEach(async () => {
+    try {
+      await server.close();
+    } catch (error: any) {
+      if (error?.code !== 'ERR_SERVER_NOT_RUNNING') {
+        throw error;
+      }
+    }
+    db.close();
+    loggerSpies.forEach(spy => spy.mockRestore());
+    mock.restore();
+  });
+
+  it.each(['/v1/search', '/v1/context'])('rejects oversized distinct search queries with HTTP 400 at %s', async route => {
+    const { project } = await (await post('/v1/projects', { name: 'Query bounds' })).json();
+    const response = await post(route, { projectId: project.id,
+      query: Array.from({ length: 65 }, (_, index) => `项目${index}`).join(' ') });
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toBe('ValidationError');
+  });
+
+  it.each(['/v1/search', '/v1/context'])('deduplicates repeated terms at %s before the limit', async route => {
+    const { project } = await (await post('/v1/projects', { name: 'Query duplicates' })).json();
+    const { memory } = await (await post('/v1/memories', { projectId: project.id,
+      kind: 'manual', type: 'note', text: '修改了项目配置' })).json();
+    const response = await post(route, { projectId: project.id,
+      query: Array(1000).fill('项目').join(' ') });
+    expect(response.status).toBe(200);
+    expect((await response.json()).memories.map((row: { id: string }) => row.id)).toEqual([memory.id]);
+  });
+
+  it.each(['ＡＢＣ', 'ﬁles'])('searches the stored Unicode token form: %s', async title => {
+    const projectResponse = await post('/v1/projects', { name: 'Unicode memory' });
+    const { project } = await projectResponse.json();
+    const memoryResponse = await post('/v1/memories', {
+      projectId: project.id, kind: 'manual', type: 'note', title,
+    });
+    expect(memoryResponse.status).toBe(201);
+    const { memory } = await memoryResponse.json();
+
+    const searchResponse = await post('/v1/search', { projectId: project.id, query: title });
+    expect(searchResponse.status).toBe(200);
+    const { memories } = await searchResponse.json();
+    expect(memories.map((row: { id: string }) => row.id)).toEqual([memory.id]);
+  });
+
+  it.each([['ABC', 'ＡＢＣ'], ['files', 'ﬁles']])('preserves compatibility searches for %s using %s', async (title, query) => {
+    const { project } = await (await post('/v1/projects', { name: 'Compatibility search' })).json();
+    const { memory } = await (await post('/v1/memories', { projectId: project.id, kind: 'manual', type: 'note', title })).json();
+    const { memories } = await (await post('/v1/search', { projectId: project.id, query })).json();
+    expect(memories.map((row: { id: string }) => row.id)).toEqual([memory.id]);
+  });
+
+  it.each([['ＡＢＣ files', 'ＡＢＣ ﬁles'], ['ABC ﬁles', 'ＡＢＣ ﬁles']])('matches mixed token forms in %s', async (title, query) => {
+    const { project } = await (await post('/v1/projects', { name: 'Mixed compatibility search' })).json();
+    const { memory } = await (await post('/v1/memories', { projectId: project.id, kind: 'manual', type: 'note', title })).json();
+    const { memories } = await (await post('/v1/search', { projectId: project.id, query })).json();
+    expect(memories.map((row: { id: string }) => row.id)).toEqual([memory.id]);
+    const { memories: unrelated } = await (await post('/v1/search', { projectId: project.id, query: query + ' absent' })).json();
+    expect(unrelated).toEqual([]);
+  });
+
+  it.each([['TM', '™'], ['ＡＢＣ TM files', 'ＡＢＣ ™ ﬁles'], ['a c', '℀']])('normalizes compatibility symbols in %s using %s', async (title, query) => {
+    const { project } = await (await post('/v1/projects', { name: 'Symbol compatibility search' })).json();
+    const { memory } = await (await post('/v1/memories', { projectId: project.id, kind: 'manual', type: 'note', title })).json();
+    const { memories } = await (await post('/v1/search', { projectId: project.id, query })).json();
+    expect(memories.map((row: { id: string }) => row.id)).toEqual([memory.id]);
+    const { memories: unrelated } = await (await post('/v1/search', { projectId: project.id, query: query + ' absent' })).json();
+    expect(unrelated).toEqual([]);
+  });
+
+  it.each([['™', 'TM'], ['℀', 'a c']])('filters %s alternatives before a one-result limit', async (symbol, expansion) => {
+    const { project } = await (await post('/v1/projects', { name: 'Symbol precision' })).json();
+    const ids: string[] = [];
+    for (const [index, title] of [`Acme ${symbol} launch`, `Acme ${expansion} launch`, 'Acme launch'].entries()) {
+      const { memory } = await (await post('/v1/memories', { projectId: project.id, kind: 'manual', type: 'note', title })).json();
+      db.prepare('UPDATE memory_items SET updated_at_epoch = ? WHERE id = ?').run(index + 1, memory.id);
+      ids.push(memory.id);
+    }
+    const { project: foreign } = await (await post('/v1/projects', { name: 'Other symbol project' })).json();
+    await post('/v1/memories', { projectId: foreign.id, kind: 'manual', type: 'note', title: `Acme ${symbol} launch` });
+    const query = `Acme ${symbol} launch`;
+    const { memories } = await (await post('/v1/search', { projectId: project.id, query })).json();
+    expect(memories.map((row: { id: string }) => row.id)).toEqual([ids[1], ids[0]]);
+    const { memories: limited } = await (await post('/v1/search', { projectId: project.id, query, limit: 1 })).json();
+    expect(limited.map((row: { id: string }) => row.id)).toEqual([ids[1]]);
+    const { memories: unrelated } = await (await post('/v1/search', { projectId: project.id, query: query + ' absent' })).json();
+    expect(unrelated).toEqual([]);
+  });
+
+  it.each([['™', 'TM'], ['℀', 'a c']])('pure %s queries retain raw and expanded memories', async (symbol, expansion) => {
+    const { project } = await (await post('/v1/projects', { name: 'Pure symbol precision' })).json();
+    const ids: string[] = [];
+    for (const [index, title] of [symbol, expansion, 'unrelated plain title'].entries()) {
+      const { memory } = await (await post('/v1/memories', { projectId: project.id, kind: 'manual', type: 'note', title })).json();
+      db.prepare('UPDATE memory_items SET updated_at_epoch = ? WHERE id = ?').run(index + 1, memory.id);
+      ids.push(memory.id);
+    }
+    const { memories } = await (await post('/v1/search', { projectId: project.id, query: symbol })).json();
+    expect(memories.map((row: { id: string }) => row.id)).toEqual([ids[1], ids[0]]);
+    db.prepare('UPDATE memory_items SET updated_at_epoch = 4 WHERE id = ?').run(ids[0]);
+    const { memories: limited } = await (await post('/v1/search', { projectId: project.id, query: symbol, limit: 1 })).json();
+    expect(limited.map((row: { id: string }) => row.id)).toEqual([ids[0]]);
+  });
+
+  it('requires each symbol alternative in mixed raw and expanded documents', async () => {
+    const { project } = await (await post('/v1/projects', { name: 'Multiple symbol constraints' })).json();
+    const ids: string[] = [];
+    const titles = ['Acme ™ ℀ launch', 'Acme TM ℀ launch', 'Acme ™ a c launch', 'Acme TM a c launch',
+      'Acme ™ launch', 'Acme ℀ launch', 'Acme launch', 'Acme TM launch', 'Acme a c launch', 'Other ™ ℀ launch'];
+    for (const [index, title] of titles.entries()) {
+      const { memory } = await (await post('/v1/memories', { projectId: project.id, kind: 'manual', type: 'note', title })).json();
+      db.prepare('UPDATE memory_items SET updated_at_epoch = ? WHERE id = ?').run(index + 1, memory.id);
+      ids.push(memory.id);
+    }
+    const { memories } = await (await post('/v1/search', { projectId: project.id, query: 'Acme ™ ℀ launch' })).json();
+    expect(memories.map((row: { id: string }) => row.id)).toEqual(ids.slice(0, 4).reverse());
+    const { memories: limited } = await (await post('/v1/search', { projectId: project.id, query: 'Acme ™ ℀ launch', limit: 1 })).json();
+    expect(limited.map((row: { id: string }) => row.id)).toEqual([ids[3]]);
+  });
+
+  it('checks literal symbols only in the fields indexed by FTS', async () => {
+    const { project } = await (await post('/v1/projects', { name: 'Indexed symbol fields' })).json();
+    const ids: string[] = [];
+    for (const [index, field] of ['title', 'subtitle', 'text', 'narrative', 'facts', 'concepts', 'metadata', 'filesRead', 'filesModified'].entries()) {
+      const value = field === 'metadata' ? { symbol: '™' }
+        : ['facts', 'concepts', 'filesRead', 'filesModified'].includes(field) ? ['™'] : '™';
+      const { memory } = await (await post('/v1/memories', {
+        projectId: project.id, kind: 'manual', type: 'note', title: 'Acme launch',
+        [field]: field === 'title' ? 'Acme ™ launch' : value,
+      })).json();
+      db.prepare('UPDATE memory_items SET updated_at_epoch = ? WHERE id = ?').run(index + 1, memory.id);
+      ids.push(memory.id);
+    }
+    const { memories } = await (await post('/v1/search', { projectId: project.id, query: 'Acme ™ launch' })).json();
+    expect(memories.map((row: { id: string }) => row.id)).toEqual(ids.slice(0, 6).reverse());
+  });
+
+  it.each(['Acme ™ launch', 'Acme ℀ launch', 'Acme ™ ﬁles'])('retains literal symbol separators in stored %s', async title => {
+    const { project } = await (await post('/v1/projects', { name: 'Literal symbol search' })).json();
+    const { memory } = await (await post('/v1/memories', { projectId: project.id, kind: 'manual', type: 'note', title })).json();
+    const { memories } = await (await post('/v1/search', { projectId: project.id, query: title })).json();
+    expect(memories.map((row: { id: string }) => row.id)).toEqual([memory.id]);
+    const { memories: unrelated } = await (await post('/v1/search', { projectId: project.id, query: title + ' absent' })).json();
+    expect(unrelated).toEqual([]);
+  });
+
+  it('creates projects, sessions, events, memories, and searchable context', async () => {
+    const projectResponse = await post('/v1/projects', {
+      name: 'Claude Mem',
+      rootPath: '/tmp/claude-mem',
+    });
+    expect(projectResponse.status).toBe(201);
+    const { project } = await projectResponse.json();
+
+    const sessionResponse = await post('/v1/sessions/start', {
+      projectId: project.id,
+      memorySessionId: 'memory-1',
+    });
+    expect(sessionResponse.status).toBe(201);
+    const { session } = await sessionResponse.json();
+
+    const eventResponse = await post('/v1/events', {
+      projectId: project.id,
+      serverSessionId: session.id,
+      sourceType: 'api',
+      eventType: 'observation.created',
+      payload: { type: 'learned' },
+      occurredAtEpoch: Date.now(),
+    });
+    expect(eventResponse.status).toBe(201);
+
+    const memoryResponse = await post('/v1/memories', {
+      projectId: project.id,
+      serverSessionId: session.id,
+      kind: 'manual',
+      type: 'note',
+      title: 'Queue backend',
+      narrative: 'BullMQ keeps deployable server queues in Valkey.',
+      facts: ['BullMQ mode requires Redis or Valkey'],
+    });
+    expect(memoryResponse.status).toBe(201);
+    const { memory } = await memoryResponse.json();
+
+    const searchResponse = await post('/v1/search', {
+      projectId: project.id,
+      query: 'BullMQ',
+    });
+    expect(searchResponse.status).toBe(200);
+    const search = await searchResponse.json();
+    expect(search.memories.map((item: any) => item.id)).toContain(memory.id);
+
+    const stemmedSearchResponse = await post('/v1/search', {
+      projectId: project.id,
+      query: 'queue',
+    });
+    expect(stemmedSearchResponse.status).toBe(200);
+    const stemmedSearch = await stemmedSearchResponse.json();
+    expect(stemmedSearch.memories.map((item: any) => item.id)).toContain(memory.id);
+
+    const contextResponse = await post('/v1/context', {
+      projectId: project.id,
+      query: 'Valkey',
+    });
+    expect(contextResponse.status).toBe(200);
+    const context = await contextResponse.json();
+    expect(context.context).toContain('Valkey');
+
+    const endResponse = await post(`/v1/sessions/${session.id}/end`, {});
+    expect(endResponse.status).toBe(200);
+    expect((await endResponse.json()).session.status).toBe('completed');
+  });
+
+  it('returns recent memories when /v1/context is given no query', async () => {
+    // A session-start block asks "what happened recently". Until this, /v1/context
+    // ran the same relevance search as /v1/search and REQUIRED a query, so it could
+    // not answer that at all -- it returned whatever matched, from any date.
+    const projectResponse = await post('/v1/projects', { name: 'Recent Context Project' });
+    expect(projectResponse.status).toBe(201);
+    const { project } = await projectResponse.json();
+
+    const older = await post('/v1/memories', {
+      projectId: project.id,
+      kind: 'manual',
+      type: 'note',
+      title: 'Older note',
+      narrative: 'Written first.',
+    });
+    expect(older.status).toBe(201);
+    const olderId = (await older.json()).memory.id;
+
+    // created_at_epoch is server-assigned in milliseconds and the create schema
+    // omits it, so two writes in the same millisecond are genuinely tied and the
+    // ordering below would be arbitrary. Separate them in time rather than weaken
+    // the assertion — "newest first" is the behaviour under test.
+    await new Promise(resolve => setTimeout(resolve, 5));
+
+    const newer = await post('/v1/memories', {
+      projectId: project.id,
+      kind: 'manual',
+      type: 'note',
+      title: 'Newer note',
+      narrative: 'Written second.',
+    });
+    expect(newer.status).toBe(201);
+    const newerId = (await newer.json()).memory.id;
+
+    const response = await post('/v1/context', { projectId: project.id, limit: 10 });
+    expect(response.status).toBe(200);
+    const body = await response.json();
+
+    const ids = body.memories.map((o: any) => o.id);
+    expect(ids).toContain(olderId);
+    expect(ids).toContain(newerId);
+    // Newest first — that is the whole point of the query-less mode.
+    expect(ids.indexOf(newerId)).toBeLessThan(ids.indexOf(olderId));
+
+    // A query still selects by relevance, unchanged.
+    const queried = await post('/v1/context', { projectId: project.id, query: 'second' });
+    expect(queried.status).toBe(200);
+    expect((await queried.json()).context).toContain('Written second.');
+  });
+
+  it('persists a full-field memory create with narrative populated and indexed (#2684)', async () => {
+    const projectResponse = await post('/v1/projects', { name: 'Write Path Project' });
+    expect(projectResponse.status).toBe(201);
+    const { project } = await projectResponse.json();
+
+    const memoryResponse = await post('/v1/memories', {
+      projectId: project.id,
+      kind: 'manual',
+      type: 'note',
+      title: 'Frozen observation fix',
+      narrative: 'The sync trigger needs narrative populated to index the row.',
+    });
+    expect(memoryResponse.status).toBe(201);
+    const { memory } = await memoryResponse.json();
+    expect(memory.narrative).toBe('The sync trigger needs narrative populated to index the row.');
+
+    // The narrative column must be populated on the persisted row — the FTS
+    // trigger reads it, so an empty narrative means "frozen observations".
+    const stored = db.prepare('SELECT narrative FROM memory_items WHERE id = ?').get(memory.id) as { narrative: string | null };
+    expect(stored.narrative).toBe('The sync trigger needs narrative populated to index the row.');
+
+    // The FTS trigger must have fired and indexed the narrative so search finds it.
+    const ftsRow = db.prepare('SELECT narrative FROM memory_items_fts WHERE memory_item_id = ?').get(memory.id) as { narrative: string | null } | undefined;
+    expect(ftsRow?.narrative).toBe('The sync trigger needs narrative populated to index the row.');
+
+    const searchResponse = await post('/v1/search', { projectId: project.id, query: 'narrative populated' });
+    expect(searchResponse.status).toBe(200);
+    const search = await searchResponse.json();
+    expect(search.memories.map((item: any) => item.id)).toContain(memory.id);
+  });
+
+  it('loudly rejects a create with no searchable content instead of persisting an empty row (#2684)', async () => {
+    const projectResponse = await post('/v1/projects', { name: 'Reject Empty Project' });
+    expect(projectResponse.status).toBe(201);
+    const { project } = await projectResponse.json();
+
+    // kind + type present (schema-valid) but every searchable text field empty.
+    const memoryResponse = await post('/v1/memories', {
+      projectId: project.id,
+      kind: 'manual',
+      type: 'note',
+    });
+    expect(memoryResponse.status).toBe(400);
+    const body = await memoryResponse.json();
+    expect(body.error).toBe('ValidationError');
+
+    // Critically: no empty row was persisted.
+    const count = db.prepare('SELECT COUNT(*) AS count FROM memory_items WHERE project_id = ?').get(project.id) as { count: number };
+    expect(count.count).toBe(0);
+    const ftsCount = db.prepare('SELECT COUNT(*) AS count FROM memory_items_fts WHERE project_id = ?').get(project.id) as { count: number };
+    expect(ftsCount.count).toBe(0);
+  });
+
+  it('denies writes when an API key lacks write scope', async () => {
+    const key = createServerApiKey(db, {
+      name: 'read only',
+      scopes: ['memories:read'],
+    });
+    const response = await fetch(`http://127.0.0.1:${port}/v1/projects`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${key.rawKey}`,
+      },
+      body: JSON.stringify({ name: 'Denied' }),
+    });
+
+    expect(response.status).toBe(403);
+  });
+
+  it('authorizes a DEFAULT-scoped API key for the read and write routes it must access (#2428)', async () => {
+    // A key created with NO explicit scopes must work against the v1 routes
+    // (which require memories:read for reads and memories:write for writes).
+    // Previously the default was [] and every route 403'd.
+    const key = createServerApiKey(db, { name: 'default-scoped' });
+    const auth = { Authorization: `Bearer ${key.rawKey}`, 'Content-Type': 'application/json' };
+
+    // Write route (memories:write) — must be allowed.
+    const writeResponse = await fetch(`http://127.0.0.1:${port}/v1/projects`, {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ name: 'Default Key Project' }),
+    });
+    expect(writeResponse.status).toBe(201);
+
+    // Read route (memories:read) — must be allowed.
+    const readResponse = await fetch(`http://127.0.0.1:${port}/v1/projects`, {
+      headers: { Authorization: `Bearer ${key.rawKey}` },
+    });
+    expect(readResponse.status).toBe(200);
+  });
+
+  it('denies project creation when an API key is scoped to an existing project', async () => {
+    const projectResponse = await post('/v1/projects', { name: 'Owner Project' });
+    expect(projectResponse.status).toBe(201);
+    const { project } = await projectResponse.json();
+    const key = createServerApiKey(db, {
+      name: 'project scoped writer',
+      projectId: project.id,
+      scopes: ['memories:write'],
+    });
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/projects`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${key.rawKey}`,
+      },
+      body: JSON.stringify({ name: 'Forbidden Project' }),
+    });
+
+    expect(response.status).toBe(403);
+    const row = db.prepare('SELECT COUNT(*) AS count FROM projects').get() as { count: number };
+    expect(row.count).toBe(1);
+  });
+
+  it('limits project listing to the API key project scope', async () => {
+    const projectAResponse = await post('/v1/projects', { name: 'Scoped Project A' });
+    const projectBResponse = await post('/v1/projects', { name: 'Scoped Project B' });
+    expect(projectAResponse.status).toBe(201);
+    expect(projectBResponse.status).toBe(201);
+    const { project: projectA } = await projectAResponse.json();
+    await projectBResponse.json();
+    const key = createServerApiKey(db, {
+      name: 'project A reader',
+      projectId: projectA.id,
+      scopes: ['memories:read'],
+    });
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/projects`, {
+      headers: {
+        Authorization: `Bearer ${key.rawKey}`,
+      },
+    });
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.projects.map((project: any) => project.id)).toEqual([projectA.id]);
+  });
+
+  it('rejects mixed-project event batches without partial writes', async () => {
+    const projectAResponse = await post('/v1/projects', { name: 'Project A' });
+    const projectBResponse = await post('/v1/projects', { name: 'Project B' });
+    expect(projectAResponse.status).toBe(201);
+    expect(projectBResponse.status).toBe(201);
+    const { project: projectA } = await projectAResponse.json();
+    const { project: projectB } = await projectBResponse.json();
+    const key = createServerApiKey(db, {
+      name: 'project A writer',
+      projectId: projectA.id,
+      scopes: ['memories:write'],
+    });
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/events/batch`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${key.rawKey}`,
+      },
+      body: JSON.stringify([
+        {
+          projectId: projectA.id,
+          sourceType: 'api',
+          eventType: 'observation.created',
+          payload: { index: 1 },
+          occurredAtEpoch: Date.now(),
+        },
+        {
+          projectId: projectB.id,
+          sourceType: 'api',
+          eventType: 'observation.created',
+          payload: { index: 2 },
+          occurredAtEpoch: Date.now(),
+        },
+      ]),
+    });
+
+    expect(response.status).toBe(403);
+    const row = db.prepare('SELECT COUNT(*) AS count FROM agent_events').get() as { count: number };
+    expect(row.count).toBe(0);
+  });
+
+  it('rejects memory updates that move records across projects', async () => {
+    const projectAResponse = await post('/v1/projects', { name: 'Memory Project A' });
+    const projectBResponse = await post('/v1/projects', { name: 'Memory Project B' });
+    expect(projectAResponse.status).toBe(201);
+    expect(projectBResponse.status).toBe(201);
+    const { project: projectA } = await projectAResponse.json();
+    const { project: projectB } = await projectBResponse.json();
+    const memoryResponse = await post('/v1/memories', {
+      projectId: projectA.id,
+      kind: 'manual',
+      type: 'note',
+      title: 'Pinned project',
+    });
+    expect(memoryResponse.status).toBe(201);
+    const { memory } = await memoryResponse.json();
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/memories/${memory.id}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        projectId: projectB.id,
+        kind: 'manual',
+        type: 'note',
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    const stored = db.prepare('SELECT project_id FROM memory_items WHERE id = ?').get(memory.id) as { project_id: string };
+    expect(stored.project_id).toBe(projectA.id);
+  });
+
+  async function post(path: string, body: unknown): Promise<Response> {
+    return fetch(`http://127.0.0.1:${port}${path}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+  }
+});

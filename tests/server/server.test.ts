@@ -1,18 +1,10 @@
 import { describe, it, expect, mock, beforeEach, afterEach, spyOn } from 'bun:test';
 import { logger } from '../../src/utils/logger.js';
 
-// Mock middleware to avoid complex dependencies
-mock.module('../../src/services/worker/http/middleware.js', () => ({
-  createMiddleware: () => [],
-  requireLocalhost: (_req: any, _res: any, next: any) => next(),
-  summarizeRequestBody: () => 'test body',
-}));
-
-// Import after mocks
 import { Server } from '../../src/services/server/Server.js';
 import type { RouteHandler, ServerOptions } from '../../src/services/server/Server.js';
+import { listenOnEphemeralPort } from '../helpers/ephemeral-port.js';
 
-// Spy on logger methods to suppress output during tests
 let loggerSpies: ReturnType<typeof spyOn>[] = [];
 
 describe('Server', () => {
@@ -43,7 +35,6 @@ describe('Server', () => {
 
   afterEach(async () => {
     loggerSpies.forEach(spy => spy.mockRestore());
-    // Clean up server if created and still has an active http server
     if (server && server.getHttpServer()) {
       try {
         await server.close();
@@ -67,11 +58,41 @@ describe('Server', () => {
     it('should expose app as readonly property', () => {
       server = new Server(mockOptions);
 
-      // App should be accessible
       expect(server.app).toBeDefined();
 
-      // App should be an Express application
       expect(typeof server.app.listen).toBe('function');
+    });
+
+    it('should register pre-body-parser routes before normal middleware', async () => {
+      server = new Server({
+        ...mockOptions,
+        preBodyParserRoutes: [{
+          setupRoutes(app) {
+            app.post('/api/auth/*splat', (req, res) => {
+              res.json({
+                bodyParsed: req.body !== undefined,
+              });
+            });
+          },
+        }],
+      });
+
+      const testPort = await listenOnEphemeralPort(server);
+
+      const response = await fetch(`http://127.0.0.1:${testPort}/api/auth/session`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Origin: 'http://localhost:37777',
+        },
+        body: JSON.stringify({ ok: true }),
+      });
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get('access-control-allow-origin')).toBe('http://localhost:37777');
+
+      const body = await response.json();
+      expect(body.bodyParsed).toBe(false);
     });
   });
 
@@ -79,12 +100,8 @@ describe('Server', () => {
     it('should start server on specified port', async () => {
       server = new Server(mockOptions);
 
-      // Use a random high port to avoid conflicts
-      const testPort = 40000 + Math.floor(Math.random() * 10000);
+      await listenOnEphemeralPort(server);
 
-      await server.listen(testPort, '127.0.0.1');
-
-      // Server should now be listening
       const httpServer = server.getHttpServer();
       expect(httpServer).not.toBeNull();
       expect(httpServer!.listening).toBe(true);
@@ -94,46 +111,33 @@ describe('Server', () => {
       server = new Server(mockOptions);
       const server2 = new Server(mockOptions);
 
-      const testPort = 40000 + Math.floor(Math.random() * 10000);
+      const testPort = await listenOnEphemeralPort(server);
 
-      // Start first server
-      await server.listen(testPort, '127.0.0.1');
-
-      // Second server should fail on same port
       await expect(server2.listen(testPort, '127.0.0.1')).rejects.toThrow();
 
-      // The server object was created but not successfully listening
-      const httpServer = server2.getHttpServer();
-      if (httpServer) {
-        expect(httpServer.listening).toBe(false);
-      }
+      // #3380 — a failed bind must never leave a non-listening handle behind
+      // for graceful shutdown to trip on.
+      expect(server2.getHttpServer()).toBeNull();
     });
   });
 
   describe('close', () => {
     it('should stop server from listening after close', async () => {
       server = new Server(mockOptions);
-      const testPort = 40000 + Math.floor(Math.random() * 10000);
+      await listenOnEphemeralPort(server);
 
-      await server.listen(testPort, '127.0.0.1');
-
-      // Server should exist and be listening
       const httpServerBefore = server.getHttpServer();
       expect(httpServerBefore).not.toBeNull();
       expect(httpServerBefore!.listening).toBe(true);
 
-      // Close the server - may throw ERR_SERVER_NOT_RUNNING on some platforms
-      // because closeAllConnections() might immediately close the server
       try {
         await server.close();
       } catch (e: any) {
-        // ERR_SERVER_NOT_RUNNING is acceptable - closeAllConnections() already closed it
         if (e.code !== 'ERR_SERVER_NOT_RUNNING') {
           throw e;
         }
       }
 
-      // The server should no longer be listening (even if ref is not null due to early throw)
       const httpServerAfter = server.getHttpServer();
       if (httpServerAfter) {
         expect(httpServerAfter.listening).toBe(false);
@@ -143,36 +147,28 @@ describe('Server', () => {
     it('should handle close when server not started', async () => {
       server = new Server(mockOptions);
 
-      // Should not throw when closing unstarted server
       await expect(server.close()).resolves.toBeUndefined();
     });
 
     it('should allow starting a new server on same port after close', async () => {
       server = new Server(mockOptions);
-      const testPort = 40000 + Math.floor(Math.random() * 10000);
+      const testPort = await listenOnEphemeralPort(server);
 
-      await server.listen(testPort, '127.0.0.1');
-
-      // Close the server
       try {
         await server.close();
       } catch (e: any) {
-        // ERR_SERVER_NOT_RUNNING is acceptable
         if (e.code !== 'ERR_SERVER_NOT_RUNNING') {
           throw e;
         }
       }
 
-      // Small delay to ensure port is released
       await new Promise(resolve => setTimeout(resolve, 100));
 
-      // Should be able to listen again on same port with a new server
       const server2 = new Server(mockOptions);
       await server2.listen(testPort, '127.0.0.1');
 
       expect(server2.getHttpServer()!.listening).toBe(true);
 
-      // Clean up server2
       try {
         await server2.close();
       } catch {
@@ -190,9 +186,7 @@ describe('Server', () => {
 
     it('should return http.Server after listen', async () => {
       server = new Server(mockOptions);
-      const testPort = 40000 + Math.floor(Math.random() * 10000);
-
-      await server.listen(testPort, '127.0.0.1');
+      await listenOnEphemeralPort(server);
 
       const httpServer = server.getHttpServer();
       expect(httpServer).not.toBeNull();
@@ -243,9 +237,7 @@ describe('Server', () => {
   describe('health endpoint', () => {
     it('should return 200 with status ok', async () => {
       server = new Server(mockOptions);
-      const testPort = 40000 + Math.floor(Math.random() * 10000);
-
-      await server.listen(testPort, '127.0.0.1');
+      const testPort = await listenOnEphemeralPort(server);
 
       const response = await fetch(`http://127.0.0.1:${testPort}/api/health`);
 
@@ -257,9 +249,7 @@ describe('Server', () => {
 
     it('should include initialization status', async () => {
       server = new Server(mockOptions);
-      const testPort = 40000 + Math.floor(Math.random() * 10000);
-
-      await server.listen(testPort, '127.0.0.1');
+      const testPort = await listenOnEphemeralPort(server);
 
       const response = await fetch(`http://127.0.0.1:${testPort}/api/health`);
       const body = await response.json();
@@ -280,19 +270,14 @@ describe('Server', () => {
       };
 
       server = new Server(dynamicOptions);
-      const testPort = 40000 + Math.floor(Math.random() * 10000);
+      const testPort = await listenOnEphemeralPort(server);
 
-      await server.listen(testPort, '127.0.0.1');
-
-      // Check when not initialized
       let response = await fetch(`http://127.0.0.1:${testPort}/api/health`);
       let body = await response.json();
       expect(body.initialized).toBe(false);
 
-      // Change state
       isInitialized = true;
 
-      // Check when initialized
       response = await fetch(`http://127.0.0.1:${testPort}/api/health`);
       body = await response.json();
       expect(body.initialized).toBe(true);
@@ -300,9 +285,7 @@ describe('Server', () => {
 
     it('should include platform and pid', async () => {
       server = new Server(mockOptions);
-      const testPort = 40000 + Math.floor(Math.random() * 10000);
-
-      await server.listen(testPort, '127.0.0.1');
+      const testPort = await listenOnEphemeralPort(server);
 
       const response = await fetch(`http://127.0.0.1:${testPort}/api/health`);
       const body = await response.json();
@@ -311,14 +294,37 @@ describe('Server', () => {
       expect(body.pid).toBeDefined();
       expect(typeof body.pid).toBe('number');
     });
+
+    it('should return degraded health when BullMQ Redis health is errored', async () => {
+      server = new Server({
+        ...mockOptions,
+        getQueueHealth: () => ({
+          engine: 'bullmq',
+          redis: {
+            status: 'error',
+            mode: 'external',
+            host: '127.0.0.1',
+            port: 6379,
+            prefix: 'test_prefix',
+            error: 'connection refused',
+          },
+        }),
+      });
+      const testPort = await listenOnEphemeralPort(server);
+
+      const response = await fetch(`http://127.0.0.1:${testPort}/api/health`);
+      const body = await response.json();
+
+      expect(response.status).toBe(503);
+      expect(body.status).toBe('degraded');
+      expect(body.queue.redis.status).toBe('error');
+    });
   });
 
   describe('readiness endpoint', () => {
     it('should return 200 when initialized', async () => {
       server = new Server(mockOptions);
-      const testPort = 40000 + Math.floor(Math.random() * 10000);
-
-      await server.listen(testPort, '127.0.0.1');
+      const testPort = await listenOnEphemeralPort(server);
 
       const response = await fetch(`http://127.0.0.1:${testPort}/api/readiness`);
 
@@ -339,9 +345,7 @@ describe('Server', () => {
       };
 
       server = new Server(uninitializedOptions);
-      const testPort = 40000 + Math.floor(Math.random() * 10000);
-
-      await server.listen(testPort, '127.0.0.1');
+      const testPort = await listenOnEphemeralPort(server);
 
       const response = await fetch(`http://127.0.0.1:${testPort}/api/readiness`);
 
@@ -356,9 +360,7 @@ describe('Server', () => {
   describe('version endpoint', () => {
     it('should return 200 with version', async () => {
       server = new Server(mockOptions);
-      const testPort = 40000 + Math.floor(Math.random() * 10000);
-
-      await server.listen(testPort, '127.0.0.1');
+      const testPort = await listenOnEphemeralPort(server);
 
       const response = await fetch(`http://127.0.0.1:${testPort}/api/version`);
 
@@ -375,8 +377,7 @@ describe('Server', () => {
       server = new Server(mockOptions);
       server.finalizeRoutes();
 
-      const testPort = 40000 + Math.floor(Math.random() * 10000);
-      await server.listen(testPort, '127.0.0.1');
+      const testPort = await listenOnEphemeralPort(server);
 
       const response = await fetch(`http://127.0.0.1:${testPort}/api/nonexistent`);
 
@@ -384,6 +385,79 @@ describe('Server', () => {
 
       const body = await response.json();
       expect(body.error).toBe('NotFound');
+    });
+  });
+
+  describe('request activity (idle exit)', () => {
+    const until = async (condition: () => boolean): Promise<void> => {
+      const deadline = Date.now() + 5_000;
+      while (!condition() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    };
+
+    it('counts an open request until its response finishes, and settles it exactly once', async () => {
+      server = new Server(mockOptions);
+      let finishHeldRequest!: () => void;
+      const heldRequestMayFinish = new Promise<void>(resolve => { finishHeldRequest = resolve; });
+      server.registerRoutes({
+        setupRoutes(app) {
+          app.get('/test/held', async (_req, res) => {
+            res.write('started;');
+            await heldRequestMayFinish;
+            res.end('done');
+          });
+        },
+      });
+      const testPort = await listenOnEphemeralPort(server);
+      expect(server.getInFlightRequestCount()).toBe(0);
+      expect(server.getLastRequestAt()).toBeNull();
+
+      const response = await fetch(`http://127.0.0.1:${testPort}/test/held`);
+      expect(server.getInFlightRequestCount()).toBe(1);
+      const startedAt = server.getLastRequestAt();
+      expect(startedAt).not.toBeNull();
+
+      finishHeldRequest();
+      expect(await response.text()).toBe('started;done');
+      await until(() => server.getInFlightRequestCount() === 0);
+      // 'finish', then 'close', then the socket's 'close' may all follow: one decrement, never below 0.
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(server.getInFlightRequestCount()).toBe(0);
+      expect(server.getLastRequestAt()!).toBeGreaterThanOrEqual(startedAt!);
+    });
+
+    it('settles a streaming request when its client disconnects, like a closed viewer tab', async () => {
+      server = new Server(mockOptions);
+      server.registerRoutes({
+        setupRoutes(app) {
+          app.get('/test/stream', (_req, res) => {
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.flushHeaders();
+            res.write(': ping\n\n'); // never ends, like the viewer's /stream
+          });
+        },
+      });
+      const testPort = await listenOnEphemeralPort(server);
+      const controller = new AbortController();
+      const response = await fetch(`http://127.0.0.1:${testPort}/test/stream`, { signal: controller.signal });
+      expect(response.status).toBe(200);
+      expect(server.getInFlightRequestCount()).toBe(1);
+
+      controller.abort();
+      await until(() => server.getInFlightRequestCount() === 0);
+      expect(server.getInFlightRequestCount()).toBe(0);
+    });
+
+    it('settles every request on a reused keep-alive connection', async () => {
+      server = new Server(mockOptions);
+      const testPort = await listenOnEphemeralPort(server);
+      for (let request = 0; request < 3; request++) {
+        const response = await fetch(`http://127.0.0.1:${testPort}/api/health`);
+        expect(response.status).toBe(200);
+        await response.text();
+      }
+      await until(() => server.getInFlightRequestCount() === 0);
+      expect(server.getInFlightRequestCount()).toBe(0);
+      expect(server.getLastRequestAt()).not.toBeNull();
     });
   });
 });

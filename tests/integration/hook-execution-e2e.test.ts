@@ -1,30 +1,24 @@
-/**
- * Hook Execution End-to-End Integration Tests
- *
- * Tests the full session lifecycle: SessionStart -> PostToolUse -> SessionEnd
- * Uses real worker on test port with in-memory SQLite database.
- *
- * Sources:
- * - Hook implementations from src/hooks/*.ts
- * - Session routes from src/services/worker/http/routes/SessionRoutes.ts
- * - Server patterns from tests/server/server.test.ts
- */
 
-import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, afterAll, spyOn, mock } from 'bun:test';
 import { logger } from '../../src/utils/logger.js';
 
-// Mock middleware to avoid complex dependencies
+// Capture the real middleware module before mock.module mutates the live
+// namespace, then re-register the snapshot in afterAll. bun's mock.module is
+// process-global and mock.restore() does NOT undo it, so without this the stub
+// createMiddleware leaks into later files (e.g. CORS + v1-routes server tests).
+import * as realMiddleware from '../../src/services/worker/http/middleware.js';
+const realMiddlewareSnapshot = { ...realMiddleware };
+
 mock.module('../../src/services/worker/http/middleware.js', () => ({
   createMiddleware: () => [],
   requireLocalhost: (_req: any, _res: any, next: any) => next(),
   summarizeRequestBody: () => 'test body',
 }));
 
-// Import after mocks
 import { Server } from '../../src/services/server/Server.js';
 import type { ServerOptions } from '../../src/services/server/Server.js';
+import { listenOnEphemeralPort } from '../helpers/ephemeral-port.js';
 
-// Suppress logger output during tests
 let loggerSpies: ReturnType<typeof spyOn>[] = [];
 
 describe('Hook Execution E2E', () => {
@@ -52,8 +46,6 @@ describe('Hook Execution E2E', () => {
         lastInteraction: null,
       }),
     };
-
-    testPort = 40000 + Math.floor(Math.random() * 10000);
   });
 
   afterEach(async () => {
@@ -69,10 +61,14 @@ describe('Hook Execution E2E', () => {
     mock.restore();
   });
 
+  afterAll(() => {
+    mock.module('../../src/services/worker/http/middleware.js', () => realMiddlewareSnapshot);
+  });
+
   describe('health and readiness endpoints', () => {
     it('should return 200 with status ok from /api/health', async () => {
       server = new Server(mockOptions);
-      await server.listen(testPort, '127.0.0.1');
+      testPort = await listenOnEphemeralPort(server);
 
       const response = await fetch(`http://127.0.0.1:${testPort}/api/health`);
       expect(response.status).toBe(200);
@@ -87,7 +83,7 @@ describe('Hook Execution E2E', () => {
 
     it('should return 200 with status ready from /api/readiness when initialized', async () => {
       server = new Server(mockOptions);
-      await server.listen(testPort, '127.0.0.1');
+      testPort = await listenOnEphemeralPort(server);
 
       const response = await fetch(`http://127.0.0.1:${testPort}/api/readiness`);
       expect(response.status).toBe(200);
@@ -107,7 +103,7 @@ describe('Hook Execution E2E', () => {
       };
 
       server = new Server(uninitializedOptions);
-      await server.listen(testPort, '127.0.0.1');
+      testPort = await listenOnEphemeralPort(server);
 
       const response = await fetch(`http://127.0.0.1:${testPort}/api/readiness`);
       expect(response.status).toBe(503);
@@ -119,7 +115,7 @@ describe('Hook Execution E2E', () => {
 
     it('should return version from /api/version', async () => {
       server = new Server(mockOptions);
-      await server.listen(testPort, '127.0.0.1');
+      testPort = await listenOnEphemeralPort(server);
 
       const response = await fetch(`http://127.0.0.1:${testPort}/api/version`);
       expect(response.status).toBe(200);
@@ -133,17 +129,15 @@ describe('Hook Execution E2E', () => {
   describe('server lifecycle', () => {
     it('should start and stop cleanly', async () => {
       server = new Server(mockOptions);
-      await server.listen(testPort, '127.0.0.1');
+      testPort = await listenOnEphemeralPort(server);
 
       const httpServer = server.getHttpServer();
       expect(httpServer).not.toBeNull();
       expect(httpServer!.listening).toBe(true);
 
-      // Verify health endpoint works
       const response = await fetch(`http://127.0.0.1:${testPort}/api/health`);
       expect(response.status).toBe(200);
 
-      // Close server
       try {
         await server.close();
       } catch (e: any) {
@@ -170,17 +164,14 @@ describe('Hook Execution E2E', () => {
       };
 
       server = new Server(dynamicOptions);
-      await server.listen(testPort, '127.0.0.1');
+      testPort = await listenOnEphemeralPort(server);
 
-      // Check when not initialized
       let response = await fetch(`http://127.0.0.1:${testPort}/api/health`);
       let body = await response.json();
       expect(body.initialized).toBe(false);
 
-      // Change state
       isInitialized = true;
 
-      // Check when initialized
       response = await fetch(`http://127.0.0.1:${testPort}/api/health`);
       body = await response.json();
       expect(body.initialized).toBe(true);
@@ -191,7 +182,7 @@ describe('Hook Execution E2E', () => {
     it('should return 404 for unknown routes after finalizeRoutes', async () => {
       server = new Server(mockOptions);
       server.finalizeRoutes();
-      await server.listen(testPort, '127.0.0.1');
+      testPort = await listenOnEphemeralPort(server);
 
       const response = await fetch(`http://127.0.0.1:${testPort}/api/nonexistent`);
       expect(response.status).toBe(404);
@@ -203,49 +194,41 @@ describe('Hook Execution E2E', () => {
     it('should accept JSON content type for POST requests', async () => {
       server = new Server(mockOptions);
       server.finalizeRoutes();
-      await server.listen(testPort, '127.0.0.1');
+      testPort = await listenOnEphemeralPort(server);
 
-      // Even though this endpoint doesn't exist, verify JSON handling
       const response = await fetch(`http://127.0.0.1:${testPort}/api/test-json`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ test: 'data' })
       });
 
-      // Should get 404 (not found), not 400 (bad request due to JSON parsing)
       expect(response.status).toBe(404);
     });
   });
 
   describe('privacy tag handling simulation', () => {
     it('should demonstrate privacy skip flow for entirely private prompt', async () => {
-      // This test simulates what the session init endpoint does
-      // with private prompts, without needing the full route handler
       server = new Server(mockOptions);
-      await server.listen(testPort, '127.0.0.1');
+      testPort = await listenOnEphemeralPort(server);
 
-      // Import tag stripping utility
-      const { stripMemoryTagsFromPrompt } = await import('../../src/utils/tag-stripping.js');
+      const { stripMemoryTags } = await import('../../src/utils/tag-stripping.js');
 
-      // Simulate the flow
       const privatePrompt = '<private>secret command</private>';
-      const cleanedPrompt = stripMemoryTagsFromPrompt(privatePrompt);
+      const cleanedPrompt = stripMemoryTags(privatePrompt);
 
-      // Verify privacy check would skip this prompt
       const shouldSkip = !cleanedPrompt || cleanedPrompt.trim() === '';
       expect(shouldSkip).toBe(true);
     });
 
     it('should demonstrate partial privacy for mixed prompts', async () => {
       server = new Server(mockOptions);
-      await server.listen(testPort, '127.0.0.1');
+      testPort = await listenOnEphemeralPort(server);
 
-      const { stripMemoryTagsFromPrompt } = await import('../../src/utils/tag-stripping.js');
+      const { stripMemoryTags } = await import('../../src/utils/tag-stripping.js');
 
       const mixedPrompt = '<private>my password is secret123</private> Help me write a function';
-      const cleanedPrompt = stripMemoryTagsFromPrompt(mixedPrompt);
+      const cleanedPrompt = stripMemoryTags(mixedPrompt);
 
-      // Should not skip - has public content
       const shouldSkip = !cleanedPrompt || cleanedPrompt.trim() === '';
       expect(shouldSkip).toBe(false);
       expect(cleanedPrompt.trim()).toBe('Help me write a function');

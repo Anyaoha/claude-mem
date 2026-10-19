@@ -1,8 +1,8 @@
 import { describe, it, expect, mock, beforeEach } from 'bun:test';
 import { ChromaSearchStrategy } from '../../../../src/services/worker/search/strategies/ChromaSearchStrategy.js';
+import { parseSearchRecencyWindowMs } from '../../../../src/services/worker/search/types.js';
 import type { StrategySearchOptions, ObservationSearchResult, SessionSummarySearchResult, UserPromptSearchResult } from '../../../../src/services/worker/search/types.js';
 
-// Mock observation data
 const mockObservation: ObservationSearchResult = {
   id: 1,
   memory_session_id: 'session-123',
@@ -19,7 +19,7 @@ const mockObservation: ObservationSearchResult = {
   prompt_number: 1,
   discovery_tokens: 100,
   created_at: '2025-01-01T12:00:00.000Z',
-  created_at_epoch: Date.now() - 1000 * 60 * 60 * 24 // 1 day ago
+  created_at_epoch: Date.now() - 1000 * 60 * 60 * 24 
 };
 
 const mockSession: SessionSummarySearchResult = {
@@ -55,7 +55,7 @@ describe('ChromaSearchStrategy', () => {
   let mockSessionStore: any;
 
   beforeEach(() => {
-    const recentEpoch = Date.now() - 1000 * 60 * 60 * 24; // 1 day ago (within 90-day window)
+    const recentEpoch = Date.now() - 1000 * 60 * 60 * 24; 
 
     mockChromaSync = {
       queryChroma: mock(() => Promise.resolve({
@@ -72,38 +72,11 @@ describe('ChromaSearchStrategy', () => {
     mockSessionStore = {
       getObservationsByIds: mock(() => [mockObservation]),
       getSessionSummariesByIds: mock(() => [mockSession]),
-      getUserPromptsByIds: mock(() => [mockPrompt])
+      getUserPromptsByIds: mock(() => [mockPrompt]),
+      getProjectReadKeys: mock((projects: string[]) => projects)
     };
 
     strategy = new ChromaSearchStrategy(mockChromaSync, mockSessionStore);
-  });
-
-  describe('canHandle', () => {
-    it('should return true when query text is present', () => {
-      const options: StrategySearchOptions = {
-        query: 'semantic search query'
-      };
-      expect(strategy.canHandle(options)).toBe(true);
-    });
-
-    it('should return false for filter-only (no query)', () => {
-      const options: StrategySearchOptions = {
-        project: 'test-project'
-      };
-      expect(strategy.canHandle(options)).toBe(false);
-    });
-
-    it('should return false when query is empty string', () => {
-      const options: StrategySearchOptions = {
-        query: ''
-      };
-      expect(strategy.canHandle(options)).toBe(false);
-    });
-
-    it('should return false when query is undefined', () => {
-      const options: StrategySearchOptions = {};
-      expect(strategy.canHandle(options)).toBe(false);
-    });
   });
 
   describe('search', () => {
@@ -118,7 +91,7 @@ describe('ChromaSearchStrategy', () => {
       expect(mockChromaSync.queryChroma).toHaveBeenCalledWith(
         'test query',
         100, // CHROMA_BATCH_SIZE
-        undefined // no where filter for 'all'
+        undefined 
       );
     });
 
@@ -130,8 +103,27 @@ describe('ChromaSearchStrategy', () => {
       const result = await strategy.search(options);
 
       expect(result.usedChroma).toBe(true);
-      expect(result.fellBack).toBe(false);
       expect(result.strategy).toBe('chroma');
+    });
+
+    it('should preserve requested date ordering in SQLite hydration', async () => {
+      const options: StrategySearchOptions = {
+        query: 'test query',
+        orderBy: 'date_asc',
+        limit: 10
+      };
+
+      await strategy.search(options);
+
+      expect(mockSessionStore.getObservationsByIds).toHaveBeenCalledWith([1], expect.objectContaining({
+        orderBy: 'date_asc'
+      }));
+      expect(mockSessionStore.getSessionSummariesByIds).toHaveBeenCalledWith([2], expect.objectContaining({
+        orderBy: 'date_asc'
+      }));
+      expect(mockSessionStore.getUserPromptsByIds).toHaveBeenCalledWith([3], expect.objectContaining({
+        orderBy: 'date_asc'
+      }));
     });
 
     it('should hydrate observations from SQLite', async () => {
@@ -166,6 +158,26 @@ describe('ChromaSearchStrategy', () => {
       await strategy.search(options);
 
       expect(mockSessionStore.getUserPromptsByIds).toHaveBeenCalled();
+    });
+
+    it('should pass platformSource through all SQLite hydration calls', async () => {
+      const options: StrategySearchOptions = {
+        query: 'test query',
+        platformSource: 'cursor',
+        limit: 10
+      };
+
+      await strategy.search(options);
+
+      expect(mockSessionStore.getObservationsByIds).toHaveBeenCalledWith([1], expect.objectContaining({
+        platformSource: 'cursor'
+      }));
+      expect(mockSessionStore.getSessionSummariesByIds).toHaveBeenCalledWith([2], expect.objectContaining({
+        platformSource: 'cursor'
+      }));
+      expect(mockSessionStore.getUserPromptsByIds).toHaveBeenCalledWith([3], expect.objectContaining({
+        platformSource: 'cursor'
+      }));
     });
 
     it('should filter by doc_type when searchType is observations', async () => {
@@ -224,8 +236,27 @@ describe('ChromaSearchStrategy', () => {
       expect(mockChromaSync.queryChroma).toHaveBeenCalledWith(
         'test query',
         100,
-        { project: 'my-project' }
+        { $or: [{ project: 'my-project' }, { merged_into_project: 'my-project' }] }
       );
+    });
+
+    it('should scope the project to every key it reads, in Chroma and in the hydration (#3531, gate P2-5)', async () => {
+      mockSessionStore.getProjectReadKeys = mock(() => ['my-project', 'My-Project', 'old-folder']);
+      const options: StrategySearchOptions = {
+        query: 'test query',
+        project: 'my-project'
+      };
+
+      await strategy.search(options);
+
+      const readKeys = ['my-project', 'My-Project', 'old-folder'];
+      expect(mockSessionStore.getProjectReadKeys).toHaveBeenCalledWith(['my-project']);
+      expect(mockChromaSync.queryChroma).toHaveBeenCalledWith(
+        'test query',
+        100,
+        { $or: [{ project: { $in: readKeys } }, { merged_into_project: { $in: readKeys } }] }
+      );
+      expect(mockSessionStore.getObservationsByIds).toHaveBeenCalledWith([1], expect.objectContaining({ projects: readKeys }));
     });
 
     it('should combine doc_type and project with $and when both specified', async () => {
@@ -240,7 +271,39 @@ describe('ChromaSearchStrategy', () => {
       expect(mockChromaSync.queryChroma).toHaveBeenCalledWith(
         'test query',
         100,
-        { $and: [{ doc_type: 'observation' }, { project: 'my-project' }] }
+        { $and: [{ doc_type: 'observation' }, { $or: [{ project: 'my-project' }, { merged_into_project: 'my-project' }] }] }
+      );
+    });
+
+    it('should include platformSource in Chroma where clause when specified', async () => {
+      const options: StrategySearchOptions = {
+        query: 'test query',
+        platformSource: 'cursor'
+      };
+
+      await strategy.search(options);
+
+      expect(mockChromaSync.queryChroma).toHaveBeenCalledWith(
+        'test query',
+        100,
+        { platform_source: 'cursor' }
+      );
+    });
+
+    it('should combine doc_type, project, and platformSource with $and when specified', async () => {
+      const options: StrategySearchOptions = {
+        query: 'test query',
+        searchType: 'observations',
+        project: 'my-project',
+        platformSource: 'cursor'
+      };
+
+      await strategy.search(options);
+
+      expect(mockChromaSync.queryChroma).toHaveBeenCalledWith(
+        'test query',
+        100,
+        { $and: [{ doc_type: 'observation' }, { $or: [{ project: 'my-project' }, { merged_into_project: 'my-project' }] }, { platform_source: 'cursor' }] }
       );
     });
 
@@ -286,11 +349,11 @@ describe('ChromaSearchStrategy', () => {
       const result = await strategy.search(options);
 
       expect(result.results.observations).toHaveLength(0);
-      expect(result.usedChroma).toBe(true); // Still used Chroma, just no results
+      expect(result.usedChroma).toBe(true); 
     });
 
     it('should filter out old results (beyond 90-day window)', async () => {
-      const oldEpoch = Date.now() - 1000 * 60 * 60 * 24 * 100; // 100 days ago
+      const oldEpoch = Date.now() - 1000 * 60 * 60 * 24 * 100; 
 
       mockChromaSync.queryChroma = mock(() => Promise.resolve({
         ids: [1],
@@ -306,27 +369,20 @@ describe('ChromaSearchStrategy', () => {
 
       const result = await strategy.search(options);
 
-      // Old results should be filtered out
       expect(mockSessionStore.getObservationsByIds).not.toHaveBeenCalled();
     });
 
-    it('should handle Chroma errors gracefully (returns usedChroma: false)', async () => {
+    it('should propagate Chroma errors (fail-fast, no silent fallback)', async () => {
       mockChromaSync.queryChroma = mock(() => Promise.reject(new Error('Chroma connection failed')));
 
       const options: StrategySearchOptions = {
         query: 'test query'
       };
 
-      const result = await strategy.search(options);
-
-      expect(result.usedChroma).toBe(false);
-      expect(result.fellBack).toBe(false);
-      expect(result.results.observations).toHaveLength(0);
-      expect(result.results.sessions).toHaveLength(0);
-      expect(result.results.prompts).toHaveLength(0);
+      await expect(strategy.search(options)).rejects.toThrow('Chroma connection failed');
     });
 
-    it('should handle SQLite hydration errors gracefully', async () => {
+    it('should propagate SQLite hydration errors (fail-fast)', async () => {
       mockSessionStore.getObservationsByIds = mock(() => {
         throw new Error('SQLite error');
       });
@@ -336,26 +392,16 @@ describe('ChromaSearchStrategy', () => {
         searchType: 'observations'
       };
 
-      const result = await strategy.search(options);
-
-      expect(result.usedChroma).toBe(false); // Error occurred
-      expect(result.results.observations).toHaveLength(0);
+      await expect(strategy.search(options)).rejects.toThrow('SQLite error');
     });
 
     it('should correctly align IDs with metadatas when Chroma returns duplicate sqlite_ids (multiple docs per observation)', async () => {
-      // BUG SCENARIO: One observation (id=100) has 3 documents in Chroma (narrative + 2 facts)
-      // Another observation (id=200) has 1 document
-      // Chroma returns 4 metadatas but after deduplication we have 2 unique IDs
-      // The metadatas MUST be deduplicated/aligned to match the unique IDs
-      const recentEpoch = Date.now() - 1000 * 60 * 60 * 24; // 1 day ago
+      const recentEpoch = Date.now() - 1000 * 60 * 60 * 24; 
 
       mockChromaSync.queryChroma = mock(() => Promise.resolve({
-        // After deduplication in ChromaSync.queryChroma, ids should be [100, 200]
-        // But metadatas array has 4 elements - THIS IS THE BUG
         ids: [100, 200],  // Deduplicated
         distances: [0.3, 0.4, 0.5, 0.6],  // Original 4 distances
         metadatas: [
-          // Original 4 metadatas - not aligned with deduplicated ids!
           { sqlite_id: 100, doc_type: 'observation', created_at_epoch: recentEpoch },
           { sqlite_id: 100, doc_type: 'observation', created_at_epoch: recentEpoch },
           { sqlite_id: 100, doc_type: 'observation', created_at_epoch: recentEpoch },
@@ -363,11 +409,9 @@ describe('ChromaSearchStrategy', () => {
         ]
       }));
 
-      // Mock that returns observations when called with correct IDs
       const mockObs100 = { ...mockObservation, id: 100 };
       const mockObs200 = { ...mockObservation, id: 200, title: 'Second observation' };
       mockSessionStore.getObservationsByIds = mock((ids: number[]) => {
-        // Should receive [100, 200]
         return ids.map(id => id === 100 ? mockObs100 : mockObs200);
       });
 
@@ -378,21 +422,16 @@ describe('ChromaSearchStrategy', () => {
 
       const result = await strategy.search(options);
 
-      // The strategy should correctly identify BOTH observations
-      // Before the fix: idx=2 and idx=3 would access ids[2] and ids[3] which are undefined
       expect(result.usedChroma).toBe(true);
       expect(mockSessionStore.getObservationsByIds).toHaveBeenCalled();
 
-      // Verify the correct IDs were passed to SQLite hydration
       const calledWith = mockSessionStore.getObservationsByIds.mock.calls[0][0];
       expect(calledWith).toContain(100);
       expect(calledWith).toContain(200);
-      expect(calledWith.length).toBe(2); // Should have exactly 2 unique IDs
+      expect(calledWith.length).toBe(2); 
     });
 
     it('should handle misaligned arrays gracefully without undefined access', async () => {
-      // Edge case: metadatas array longer than ids array
-      // This simulates the actual bug condition
       const recentEpoch = Date.now() - 1000 * 60 * 60 * 24;
 
       mockChromaSync.queryChroma = mock(() => Promise.resolve({
@@ -402,7 +441,7 @@ describe('ChromaSearchStrategy', () => {
           { sqlite_id: 100, doc_type: 'observation', created_at_epoch: recentEpoch },
           { sqlite_id: 100, doc_type: 'observation', created_at_epoch: recentEpoch },
           { sqlite_id: 100, doc_type: 'observation', created_at_epoch: recentEpoch }
-        ]  // 3 metadatas for same observation
+        ]  
       }));
 
       mockSessionStore.getObservationsByIds = mock(() => [mockObservation]);
@@ -412,21 +451,153 @@ describe('ChromaSearchStrategy', () => {
         searchType: 'observations'
       };
 
-      // Before fix: This would try to access ids[1], ids[2] which are undefined
-      // causing incorrect filtering or crashes
       const result = await strategy.search(options);
 
       expect(result.usedChroma).toBe(true);
-      // Should still find the one observation correctly
       expect(mockSessionStore.getObservationsByIds).toHaveBeenCalled();
       const calledWith = mockSessionStore.getObservationsByIds.mock.calls[0][0];
       expect(calledWith).toEqual([100]);
     });
   });
 
-  describe('strategy name', () => {
-    it('should have name "chroma"', () => {
-      expect(strategy.name).toBe('chroma');
+  // The implicit window date-less searches apply (#4770). filterByRecency is
+  // a pure function over the aligned {ids, metadatas} arrays Chroma returns,
+  // so these cases run fully offline against constructed arrays.
+  describe('default recency window (#4770)', () => {
+    const DAY_MS = 24 * 60 * 60 * 1000;
+
+    interface Hit { id: number; docType: string; ageDays: number }
+
+    function makeResults(hits: Hit[]) {
+      const now = Date.now();
+      return {
+        ids: hits.map(hit => hit.id),
+        metadatas: hits.map(hit => ({
+          sqlite_id: hit.id,
+          doc_type: hit.docType,
+          created_at_epoch: now - hit.ageDays * DAY_MS
+        }))
+      };
+    }
+
+    function strategyWithWindow(defaultRecencyWindowMs?: number): ChromaSearchStrategy {
+      const chromaSync: any = { queryChroma: mock(() => Promise.resolve({ ids: [], distances: [], metadatas: [] })) };
+      const sessionStore: any = {
+        getObservationsByIds: mock(() => []),
+        getSessionSummariesByIds: mock(() => []),
+        getUserPromptsByIds: mock(() => []),
+        getProjectReadKeys: mock((projects: string[]) => projects)
+      };
+      return defaultRecencyWindowMs === undefined
+        ? new ChromaSearchStrategy(chromaSync, sessionStore)
+        : new ChromaSearchStrategy(chromaSync, sessionStore, defaultRecencyWindowMs);
+    }
+
+    const survivingIds = (strategy: ChromaSearchStrategy, hits: Hit[], dateRange?: any, ignoreWindow?: boolean) => {
+      const kept = (strategy as any).filterByRecency(makeResults(hits), dateRange, ignoreWindow ?? false);
+      return kept.map((item: { id: number }) => item.id);
+    };
+
+    it('keeps the shipped 90-day window when no window is configured', () => {
+      const strategy = strategyWithWindow();
+      const kept = survivingIds(strategy, [
+        { id: 1, docType: 'observation', ageDays: 1 },
+        { id: 2, docType: 'observation', ageDays: 91 }
+      ]);
+      expect(kept).toEqual([1]);
+    });
+
+    it('drops the window entirely when configured with 0 days', () => {
+      const strategy = strategyWithWindow(0);
+      const kept = survivingIds(strategy, [
+        { id: 1, docType: 'observation', ageDays: 1 },
+        { id: 2, docType: 'observation', ageDays: 365 }
+      ]);
+      expect(kept).toEqual([1, 2]);
+    });
+
+    it('honors a custom window of N days', () => {
+      const strategy = strategyWithWindow(30 * DAY_MS);
+      const kept = survivingIds(strategy, [
+        { id: 1, docType: 'observation', ageDays: 10 },
+        { id: 2, docType: 'observation', ageDays: 31 }
+      ]);
+      expect(kept).toEqual([1]);
+    });
+
+    it('applies an explicit dateRange instead of the configured window', () => {
+      const strategy = strategyWithWindow(30 * DAY_MS);
+      const now = Date.now();
+      const kept = survivingIds(
+        strategy,
+        [
+          { id: 1, docType: 'observation', ageDays: 1 },
+          { id: 2, docType: 'observation', ageDays: 200 }
+        ],
+        { start: now - 300 * DAY_MS, end: now }
+      );
+      // The 200-day-old hit fails the 30-day window but sits inside the
+      // requested range, so the range — not the window — decided.
+      expect(kept).toEqual([1, 2]);
+    });
+
+    it('still bypasses the window for corpus builds (ignoreDefaultRecencyWindow)', () => {
+      const strategy = strategyWithWindow(30 * DAY_MS);
+      const kept = survivingIds(
+        strategy,
+        [{ id: 1, docType: 'observation', ageDays: 365 }],
+        undefined,
+        true
+      );
+      expect(kept).toEqual([1]);
+    });
+  });
+
+  describe('parseSearchRecencyWindowMs (#4770)', () => {
+    const DAY_MS = 24 * 60 * 60 * 1000;
+
+    it('keeps the 90-day default for an absent or empty value', () => {
+      expect(parseSearchRecencyWindowMs(undefined)).toBe(90 * DAY_MS);
+      expect(parseSearchRecencyWindowMs('')).toBe(90 * DAY_MS);
+      expect(parseSearchRecencyWindowMs('  ')).toBe(90 * DAY_MS);
+    });
+
+    it('parses 0 as "window disabled"', () => {
+      expect(parseSearchRecencyWindowMs('0')).toBe(0);
+      expect(parseSearchRecencyWindowMs(' 0 ')).toBe(0);
+    });
+
+    it('parses a positive integer of days to milliseconds', () => {
+      expect(parseSearchRecencyWindowMs('30')).toBe(30 * DAY_MS);
+      expect(parseSearchRecencyWindowMs(' 365 ')).toBe(365 * DAY_MS);
+    });
+
+    it('rejects malformed values with null (caller keeps the default)', () => {
+      expect(parseSearchRecencyWindowMs('abc')).toBe(null);
+      expect(parseSearchRecencyWindowMs('1.5')).toBe(null);
+      expect(parseSearchRecencyWindowMs('-3')).toBe(null);
+      expect(parseSearchRecencyWindowMs('NaN')).toBe(null);
+    });
+
+    // settings.json is hand-editable JSON and SettingsDefaultsManager leaves
+    // JSON numbers untouched, so a hand-written `0` arrives here as a real
+    // number; these must parse like their string spelling, not throw.
+    it('parses JSON-numeric values like their string spelling', () => {
+      expect(parseSearchRecencyWindowMs(0)).toBe(0);
+      expect(parseSearchRecencyWindowMs(30)).toBe(30 * DAY_MS);
+      expect(parseSearchRecencyWindowMs(90)).toBe(90 * DAY_MS);
+    });
+
+    it('rejects malformed numeric values with null (caller keeps the default)', () => {
+      expect(parseSearchRecencyWindowMs(-3)).toBe(null);
+      expect(parseSearchRecencyWindowMs(1.5)).toBe(null);
+    });
+
+    it('rejects null and other non-string types with null (caller keeps the default)', () => {
+      expect(parseSearchRecencyWindowMs(null)).toBe(null);
+      expect(parseSearchRecencyWindowMs(false)).toBe(null);
+      expect(parseSearchRecencyWindowMs({ days: 30 })).toBe(null);
+      expect(parseSearchRecencyWindowMs(['30'])).toBe(null);
     });
   });
 });

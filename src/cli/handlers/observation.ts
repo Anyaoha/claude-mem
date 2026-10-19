@@ -1,76 +1,131 @@
-/**
- * Observation Handler - PostToolUse
- *
- * Extracted from save-hook.ts - sends tool usage to worker for storage.
- */
-
+// IO discipline (see src/shared/hook-io.ts): this handler is PURE. It returns a
+// HookResult and MUST NOT call process.stderr.write / process.stdout.write /
+// console.* / process.exit. logger.* calls are DIAGNOSTIC; thrown errors are
+// caught by hookCommand, logged, and answered with a no-op (never exit 2).
 import type { EventHandler, NormalizedHookInput, HookResult } from '../types.js';
-import { ensureWorkerRunning, workerHttpRequest } from '../../shared/worker-utils.js';
+import { spoolHookEvent } from '../spool-hook-event.js';
 import { logger } from '../../utils/logger.js';
+import { redactForLog } from '../../utils/redaction.js';
 import { HOOK_EXIT_CODES } from '../../shared/hook-constants.js';
-import { isProjectExcluded } from '../../utils/project-filter.js';
-import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
-import { USER_SETTINGS_PATH } from '../../shared/paths.js';
+import { shouldTrackProject } from '../../shared/should-track-project.js';
+import { shouldSkipAgentObservation } from '../../shared/should-skip-agent-observation.js';
+import { loadFromFileOnce } from '../../shared/hook-settings.js';
+import { isToolSkipped } from '../../shared/is-tool-skipped.js';
+import { normalizePlatformSource } from '../../shared/platform-source.js';
+import { resolveRuntimeContext, logServerFallback } from '../../services/hooks/runtime-selector.js';
+import { isServerClientError, type ServerRecordEventRequest } from '../../services/hooks/server-client.js';
+import { isRecursiveMemoryTool, isExplicitMemoryWrite } from '../../shared/memory-retrieval-tools.js';
+import { workStatePlatform } from '../../shared/work-state-telemetry.js';
+
+function spoolObservation(input: NormalizedHookInput, platformSource: string): HookResult {
+  spoolHookEvent('observation', {
+    contentSessionId: input.sessionId,
+    platformSource,
+    telemetryPlatformSource: workStatePlatform(input.platform),
+    toolName: input.toolName!,
+    toolInput: input.toolInput,
+    toolResponse: input.toolResponse,
+    cwd: input.cwd,
+    agentId: input.agentId,
+    agentType: input.agentType,
+    toolUseId: input.toolUseId,
+  });
+  return { continue: true, suppressOutput: true };
+}
 
 export const observationHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
-    // Ensure worker is running before any other logic
-    const workerReady = await ensureWorkerRunning();
-    if (!workerReady) {
-      // Worker not available - skip observation gracefully
-      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
-    }
-
     const { sessionId, cwd, toolName, toolInput, toolResponse } = input;
+    const platformSource = normalizePlatformSource(input.platform);
 
     if (!toolName) {
-      // No tool name provided - skip observation gracefully
       return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
     }
 
-    const toolStr = logger.formatTool(toolName, toolInput);
+    if (isRecursiveMemoryTool(toolName)) {
+      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
+    }
+
+    // A Bash command line or URL can carry a secret; logs get the redacted form.
+    const toolStr = redactForLog(logger.formatTool(toolName, toolInput));
 
     logger.dataIn('HOOK', `PostToolUse: ${toolStr}`, {});
 
-    // Validate required fields before sending to worker
     if (!cwd) {
       throw new Error(`Missing cwd in PostToolUse hook input for session ${sessionId}, tool ${toolName}`);
     }
 
-    // Check if project is excluded from tracking
-    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
-    if (isProjectExcluded(cwd, settings.CLAUDE_MEM_EXCLUDED_PROJECTS)) {
+    if (!shouldTrackProject(cwd)) {
       logger.debug('HOOK', 'Project excluded from tracking, skipping observation', { cwd, toolName });
       return { continue: true, suppressOutput: true };
     }
 
-    // Send to worker - worker handles privacy check and database operations
-    try {
-      const response = await workerHttpRequest('/api/sessions/observations', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contentSessionId: sessionId,
-          tool_name: toolName,
-          tool_input: toolInput,
-          tool_response: toolResponse,
-          cwd
-        })
+    // #2736 — drop subagent observations BEFORE any worker HTTP call or provider
+    // request. Placed ahead of the runtime branch so it covers both the worker
+    // and server runtimes. Saves the round-trip and the provider tokens, and
+    // prevents Dynamic Workflows fan-out from exhausting provider quota.
+    const skip = shouldSkipAgentObservation(input.agentId, input.agentType, loadFromFileOnce());
+    if (skip.skip) {
+      logger.debug('HOOK', `Skipping observation: ${skip.reason}`, {
+        toolName,
+        agentId: input.agentId,
+        agentType: input.agentType,
       });
-
-      if (!response.ok) {
-        // Log but don't throw — observation storage failure should not block tool use
-        logger.warn('HOOK', 'Observation storage failed, skipping', { status: response.status, toolName });
-        return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
-      }
-
-      logger.debug('HOOK', 'Observation sent successfully', { toolName });
-    } catch (error) {
-      // Worker unreachable — skip observation gracefully
-      logger.warn('HOOK', 'Observation fetch error, skipping', { error: error instanceof Error ? error.message : String(error) });
       return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
     }
 
-    return { continue: true, suppressOutput: true };
-  }
+    // Save echoes go through the worker spool so ingest can retain a write
+    // receipt, without generating a second observation of the explicit note.
+    if (isExplicitMemoryWrite(toolName)) {
+      return spoolObservation(input, platformSource);
+    }
+
+    const runtime = resolveRuntimeContext();
+    // Phase 1a (cmem-sdk rename): `runtime.runtime` is the canonical `'server'`
+    // value. `runtime-selector.selectRuntime()` continues to accept the legacy
+    // `'server-beta'` literal in settings.json and normalizes it to `'server'`.
+    if (runtime.runtime === 'server') {
+      // Server events never pass through worker ingest, which is where
+      // CLAUDE_MEM_SKIP_TOOLS applies in worker runtime, so apply it here.
+      if (isToolSkipped(toolName, loadFromFileOnce().CLAUDE_MEM_SKIP_TOOLS)) {
+        logger.debug('HOOK', 'Server runtime: tool excluded by CLAUDE_MEM_SKIP_TOOLS', { toolName });
+        return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
+      }
+      const event: ServerRecordEventRequest = {
+        projectId: runtime.projectId,
+        contentSessionId: sessionId,
+        platformSource,
+        sourceType: 'hook',
+        eventType: 'tool_use',
+        occurredAtEpoch: Date.now(),
+        payload: {
+          tool_name: toolName,
+          tool_input: toolInput,
+          tool_response: toolResponse,
+          cwd,
+          agentId: input.agentId,
+          agentType: input.agentType,
+          platformSource,
+          tool_use_id: input.toolUseId,
+        },
+      };
+      try {
+        await runtime.client.recordEvent(event);
+        logger.debug('HOOK', 'Observation sent successfully via server', { toolName });
+        return { continue: true, suppressOutput: true };
+      } catch (error: unknown) {
+        if (isServerClientError(error) && error.isFallbackEligible()) {
+          logServerFallback(error.kind, { status: error.status, message: error.message, route: '/v1/events' });
+          // fall through to the worker spool
+        } else {
+          logger.error('HOOK', 'Server event failed (non-recoverable)', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
+        }
+      }
+    }
+
+    return spoolObservation(input, platformSource);
+  },
 };

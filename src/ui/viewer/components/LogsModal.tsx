@@ -1,8 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 
-// Log levels and components matching the logger.ts definitions
 type LogLevel = 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
-type LogComponent = 'HOOK' | 'WORKER' | 'SDK' | 'PARSER' | 'DB' | 'SYSTEM' | 'HTTP' | 'SESSION' | 'CHROMA';
+type LogComponent = 'HOOK' | 'WORKER' | 'SDK' | 'PARSER' | 'DB' | 'SYSTEM' | 'HTTP' | 'SESSION' | 'CHROMA' | 'OTHER';
 
 interface ParsedLogLine {
   raw: string;
@@ -14,7 +13,6 @@ interface ParsedLogLine {
   isSpecial?: 'dataIn' | 'dataOut' | 'success' | 'failure' | 'timing' | 'happyPath';
 }
 
-// Configuration for log levels
 const LOG_LEVELS: { key: LogLevel; label: string; icon: string; color: string }[] = [
   { key: 'DEBUG', label: 'Debug', icon: '🔍', color: '#8b8b8b' },
   { key: 'INFO', label: 'Info', icon: 'ℹ️', color: '#58a6ff' },
@@ -22,7 +20,6 @@ const LOG_LEVELS: { key: LogLevel; label: string; icon: string; color: string }[
   { key: 'ERROR', label: 'Error', icon: '❌', color: '#f85149' },
 ];
 
-// Configuration for log components
 const LOG_COMPONENTS: { key: LogComponent; label: string; icon: string; color: string }[] = [
   { key: 'HOOK', label: 'Hook', icon: '🪝', color: '#a371f7' },
   { key: 'WORKER', label: 'Worker', icon: '⚙️', color: '#58a6ff' },
@@ -33,12 +30,13 @@ const LOG_COMPONENTS: { key: LogComponent; label: string; icon: string; color: s
   { key: 'HTTP', label: 'HTTP', icon: '🌐', color: '#39d353' },
   { key: 'SESSION', label: 'Session', icon: '📋', color: '#db61a2' },
   { key: 'CHROMA', label: 'Chroma', icon: '🔮', color: '#a855f7' },
+  { key: 'OTHER', label: 'Other', icon: '🧩', color: '#8b949e' },
 ];
 
-// Parse a single log line into structured data
+// The logger has more components than there are chips; the rest are filtered by the Other chip.
+const LISTED_COMPONENT_KEYS = new Set<string>(LOG_COMPONENTS.map(component => component.key));
+
 function parseLogLine(line: string): ParsedLogLine {
-  // Pattern: [timestamp] [LEVEL] [COMPONENT] [correlation?] message
-  // Example: [2025-01-02 14:30:45.123] [INFO ] [WORKER] [session-123] → message
   const pattern = /^\[([^\]]+)\]\s+\[(\w+)\s*\]\s+\[(\w+)\s*\]\s+(?:\[([^\]]+)\]\s+)?(.*)$/;
   const match = line.match(pattern);
 
@@ -48,7 +46,6 @@ function parseLogLine(line: string): ParsedLogLine {
 
   const [, timestamp, level, component, correlationId, message] = match;
 
-  // Detect special message types
   let isSpecial: ParsedLogLine['isSpecial'] = undefined;
   if (message.startsWith('→')) isSpecial = 'dataIn';
   else if (message.startsWith('←')) isSpecial = 'dataOut';
@@ -84,42 +81,51 @@ export function LogsDrawer({ isOpen, onClose }: LogsDrawerProps) {
   const startHeightRef = useRef(0);
   const contentRef = useRef<HTMLDivElement>(null);
   const wasAtBottomRef = useRef(true);
+  const requestSeqRef = useRef(0);
+  const clearingRef = useRef(false);
 
-  // Filter state
   const [activeLevels, setActiveLevels] = useState<Set<LogLevel>>(
     new Set(['DEBUG', 'INFO', 'WARN', 'ERROR'])
   );
   const [activeComponents, setActiveComponents] = useState<Set<LogComponent>>(
-    new Set(['HOOK', 'WORKER', 'SDK', 'PARSER', 'DB', 'SYSTEM', 'HTTP', 'SESSION', 'CHROMA'])
+    new Set(LOG_COMPONENTS.map(component => component.key))
   );
   const [alignmentOnly, setAlignmentOnly] = useState(false);
 
-  // Parse and filter log lines
   const parsedLines = useMemo(() => {
     if (!logs) return [];
-    return logs.split('\n').map(parseLogLine);
+    let record: ParsedLogLine | undefined;
+    return logs.split('\n').map(raw => {
+      const line = parseLogLine(raw);
+      if (line.timestamp) record = line;
+      else if (record) {
+        line.level = record.level;
+        line.component = record.component;
+      }
+      return line;
+    });
   }, [logs]);
 
   const filteredLines = useMemo(() => {
     return parsedLines.filter(line => {
-      // Alignment filter - if enabled, only show [ALIGNMENT] lines
       if (alignmentOnly) {
         return line.raw.includes('[ALIGNMENT]');
       }
-      // Always show unparsed lines
-      if (!line.level || !line.component) return true;
-      return activeLevels.has(line.level) && activeComponents.has(line.component);
+      if (!line.level || !line.component) {
+        return activeLevels.size === LOG_LEVELS.length
+          && activeComponents.size === LOG_COMPONENTS.length;
+      }
+      const componentChipKey = LISTED_COMPONENT_KEYS.has(line.component) ? line.component : 'OTHER';
+      return activeLevels.has(line.level) && activeComponents.has(componentChipKey);
     });
   }, [parsedLines, activeLevels, activeComponents, alignmentOnly]);
 
-  // Check if user is at bottom before updating
   const checkIfAtBottom = useCallback(() => {
     if (!contentRef.current) return true;
     const { scrollTop, scrollHeight, clientHeight } = contentRef.current;
     return scrollHeight - scrollTop - clientHeight < 50;
   }, []);
 
-  // Auto-scroll to bottom
   const scrollToBottom = useCallback(() => {
     if (contentRef.current && wasAtBottomRef.current) {
       contentRef.current.scrollTop = contentRef.current.scrollHeight;
@@ -127,7 +133,8 @@ export function LogsDrawer({ isOpen, onClose }: LogsDrawerProps) {
   }, []);
 
   const fetchLogs = useCallback(async () => {
-    // Save scroll position before fetch
+    if (clearingRef.current) return;
+    const request = ++requestSeqRef.current;
     wasAtBottomRef.current = checkIfAtBottom();
 
     setIsLoading(true);
@@ -138,15 +145,14 @@ export function LogsDrawer({ isOpen, onClose }: LogsDrawerProps) {
         throw new Error(`Failed to fetch logs: ${response.statusText}`);
       }
       const data = await response.json();
-      setLogs(data.logs || '');
+      if (request === requestSeqRef.current) setLogs(data.logs || '');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unknown error');
+      if (request === requestSeqRef.current) setError(err instanceof Error ? err.message : 'Unknown error');
     } finally {
-      setIsLoading(false);
+      if (request === requestSeqRef.current) setIsLoading(false);
     }
   }, [checkIfAtBottom]);
 
-  // Scroll to bottom after logs update
   useEffect(() => {
     scrollToBottom();
   }, [logs, scrollToBottom]);
@@ -155,22 +161,50 @@ export function LogsDrawer({ isOpen, onClose }: LogsDrawerProps) {
     if (!confirm('Are you sure you want to clear all logs?')) {
       return;
     }
+    const request = ++requestSeqRef.current;
+    clearingRef.current = true;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
     setIsLoading(true);
     setError(null);
     try {
-      const response = await fetch('/api/logs/clear', { method: 'POST' });
+      const response = await fetch('/api/logs/clear', { method: 'POST', signal: controller.signal });
       if (!response.ok) {
         throw new Error(`Failed to clear logs: ${response.statusText}`);
       }
-      setLogs('');
+      if (request === requestSeqRef.current) setLogs('');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unknown error');
+      if (controller.signal.aborted) {
+        // Abort only says that the acknowledgment was lost: the worker may
+        // already have cleared the file. Reconcile even with auto-refresh off,
+        // keeping this operation's request ownership and a bounded read.
+        const reconciliation = new AbortController();
+        const reconciliationTimeout = setTimeout(() => reconciliation.abort(), 5000);
+        try {
+          const response = await fetch('/api/logs', { signal: reconciliation.signal });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const data = await response.json();
+          if (request === requestSeqRef.current) {
+            setLogs(data.logs || '');
+            setError('Clear request timed out; its outcome is unknown. Displaying current logs.');
+          }
+        } catch {
+          if (request === requestSeqRef.current) {
+            setError('Clear request timed out; its outcome is unknown and current logs could not be refreshed. Try Refresh.');
+          }
+        } finally {
+          clearTimeout(reconciliationTimeout);
+        }
+      } else if (request === requestSeqRef.current) {
+        setError(err instanceof Error ? err.message : 'Unknown error');
+      }
     } finally {
-      setIsLoading(false);
+      clearTimeout(timeout);
+      clearingRef.current = false;
+      if (request === requestSeqRef.current) setIsLoading(false);
     }
   }, []);
 
-  // Handle resize
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
     setIsResizing(true);
@@ -200,15 +234,13 @@ export function LogsDrawer({ isOpen, onClose }: LogsDrawerProps) {
     };
   }, [isResizing]);
 
-  // Fetch logs when drawer opens
   useEffect(() => {
     if (isOpen) {
-      wasAtBottomRef.current = true; // Start at bottom on open
+      wasAtBottomRef.current = true; 
       fetchLogs();
     }
   }, [isOpen, fetchLogs]);
 
-  // Auto-refresh logs every 2 seconds if enabled
   useEffect(() => {
     if (!isOpen || !autoRefresh) {
       return;
@@ -218,7 +250,6 @@ export function LogsDrawer({ isOpen, onClose }: LogsDrawerProps) {
     return () => clearInterval(interval);
   }, [isOpen, autoRefresh, fetchLogs]);
 
-  // Toggle level filter
   const toggleLevel = useCallback((level: LogLevel) => {
     setActiveLevels(prev => {
       const next = new Set(prev);
@@ -231,7 +262,6 @@ export function LogsDrawer({ isOpen, onClose }: LogsDrawerProps) {
     });
   }, []);
 
-  // Toggle component filter
   const toggleComponent = useCallback((component: LogComponent) => {
     setActiveComponents(prev => {
       const next = new Set(prev);
@@ -244,7 +274,6 @@ export function LogsDrawer({ isOpen, onClose }: LogsDrawerProps) {
     });
   }, []);
 
-  // Select all / none for levels
   const setAllLevels = useCallback((enabled: boolean) => {
     if (enabled) {
       setActiveLevels(new Set(['DEBUG', 'INFO', 'WARN', 'ERROR']));
@@ -253,10 +282,9 @@ export function LogsDrawer({ isOpen, onClose }: LogsDrawerProps) {
     }
   }, []);
 
-  // Select all / none for components
   const setAllComponents = useCallback((enabled: boolean) => {
     if (enabled) {
-      setActiveComponents(new Set(['HOOK', 'WORKER', 'SDK', 'PARSER', 'DB', 'SYSTEM', 'HTTP', 'SESSION', 'CHROMA']));
+      setActiveComponents(new Set(LOG_COMPONENTS.map(component => component.key)));
     } else {
       setActiveComponents(new Set());
     }
@@ -266,7 +294,6 @@ export function LogsDrawer({ isOpen, onClose }: LogsDrawerProps) {
     return null;
   }
 
-  // Get style for a parsed log line
   const getLineStyle = (line: ParsedLogLine): React.CSSProperties => {
     const levelConfig = LOG_LEVELS.find(l => l.key === line.level);
     const componentConfig = LOG_COMPONENTS.find(c => c.key === line.component);
@@ -294,10 +321,8 @@ export function LogsDrawer({ isOpen, onClose }: LogsDrawerProps) {
     return { color, fontWeight, backgroundColor, padding: '1px 0', borderRadius: '2px' };
   };
 
-  // Render a single log line with syntax highlighting
   const renderLogLine = (line: ParsedLogLine, index: number) => {
     if (!line.timestamp) {
-      // Unparsed line - render as-is
       return (
         <div key={index} className="log-line log-line-raw">
           {line.raw}
@@ -424,7 +449,7 @@ export function LogsDrawer({ isOpen, onClose }: LogsDrawerProps) {
             ))}
             <button
               className="console-filter-action"
-              onClick={() => setAllLevels(activeLevels.size === 0)}
+              onClick={() => setAllLevels(activeLevels.size !== LOG_LEVELS.length)}
               title={activeLevels.size === LOG_LEVELS.length ? 'Select none' : 'Select all'}
             >
               {activeLevels.size === LOG_LEVELS.length ? '○' : '●'}
@@ -449,7 +474,7 @@ export function LogsDrawer({ isOpen, onClose }: LogsDrawerProps) {
             ))}
             <button
               className="console-filter-action"
-              onClick={() => setAllComponents(activeComponents.size === 0)}
+              onClick={() => setAllComponents(activeComponents.size !== LOG_COMPONENTS.length)}
               title={activeComponents.size === LOG_COMPONENTS.length ? 'Select none' : 'Select all'}
             >
               {activeComponents.size === LOG_COMPONENTS.length ? '○' : '●'}

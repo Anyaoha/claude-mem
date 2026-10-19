@@ -49,6 +49,7 @@ When Claude finishes responding (triggering the Stop hook), a summary is automat
 - **Learned** - Key discoveries and insights
 - **Completed** - What was accomplished
 - **Next Steps** - What to do next
+- **Notes** - Anything else worth keeping
 
 ### Context Injection
 
@@ -57,7 +58,7 @@ When you start a new Claude Code session, the SessionStart hook:
 1. Queries the database for recent observations in your project (default: 50)
 2. Retrieves recent session summaries for context
 3. Displays observations in a chronological timeline with session markers
-4. Shows full summary details (Investigated, Learned, Completed, Next Steps) **only if the summary was generated after the last observation**
+4. Shows full summary details (Investigated, Learned, Completed, Next Steps, Notes) **only if the summary was generated after the last observation**
 5. Injects formatted context into Claude's initial context
 
 **Summary Display Logic:**
@@ -76,7 +77,7 @@ This means Claude "remembers" what happened in previous sessions!
 
 ### Worker Management
 
-v4.0+ auto-starts the worker on first session. Manual commands below are optional.
+The worker auto-starts on the first SessionStart hook, so you usually don't need these commands. They're handy for diagnostics.
 
 ```bash
 # Start worker service (optional - auto-starts automatically)

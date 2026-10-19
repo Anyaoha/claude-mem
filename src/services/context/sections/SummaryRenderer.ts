@@ -1,17 +1,9 @@
-/**
- * SummaryRenderer - Renders the summary section at the end of context
- *
- * Handles rendering of the most recent session summary fields.
- */
 
 import type { ContextConfig, Observation, SessionSummary } from '../types.js';
 import { colors } from '../types.js';
-import * as Markdown from '../formatters/MarkdownFormatter.js';
-import * as Color from '../formatters/ColorFormatter.js';
+import * as Agent from '../formatters/AgentFormatter.js';
+import * as Human from '../formatters/HumanFormatter.js';
 
-/**
- * Check if summary should be displayed
- */
 export function shouldShowSummary(
   config: ContextConfig,
   mostRecentSummary: SessionSummary | undefined,
@@ -25,40 +17,39 @@ export function shouldShowSummary(
     mostRecentSummary.investigated ||
     mostRecentSummary.learned ||
     mostRecentSummary.completed ||
-    mostRecentSummary.next_steps
+    mostRecentSummary.next_steps ||
+    mostRecentSummary.notes
   );
 
   if (!hasContent) {
     return false;
   }
 
-  // Only show if summary is more recent than observations
-  if (mostRecentObservation && mostRecentSummary.created_at_epoch <= mostRecentObservation.created_at_epoch) {
+  if (mostRecentObservation && mostRecentSummary.created_at_epoch < mostRecentObservation.created_at_epoch) {
     return false;
   }
 
   return true;
 }
 
-/**
- * Render summary fields
- */
 export function renderSummaryFields(
   summary: SessionSummary,
-  useColors: boolean
+  forHuman: boolean
 ): string[] {
   const output: string[] = [];
 
-  if (useColors) {
-    output.push(...Color.renderColorSummaryField('Investigated', summary.investigated, colors.blue));
-    output.push(...Color.renderColorSummaryField('Learned', summary.learned, colors.yellow));
-    output.push(...Color.renderColorSummaryField('Completed', summary.completed, colors.green));
-    output.push(...Color.renderColorSummaryField('Next Steps', summary.next_steps, colors.magenta));
+  if (forHuman) {
+    output.push(...Human.renderHumanSummaryField('Investigated', summary.investigated, colors.blue));
+    output.push(...Human.renderHumanSummaryField('Learned', summary.learned, colors.yellow));
+    output.push(...Human.renderHumanSummaryField('Completed', summary.completed, colors.green));
+    output.push(...Human.renderHumanSummaryField('Next Steps', summary.next_steps, colors.magenta));
+    output.push(...Human.renderHumanSummaryField('Notes', summary.notes ?? null, colors.cyan));
   } else {
-    output.push(...Markdown.renderMarkdownSummaryField('Investigated', summary.investigated));
-    output.push(...Markdown.renderMarkdownSummaryField('Learned', summary.learned));
-    output.push(...Markdown.renderMarkdownSummaryField('Completed', summary.completed));
-    output.push(...Markdown.renderMarkdownSummaryField('Next Steps', summary.next_steps));
+    output.push(...Agent.renderAgentSummaryField('Investigated', summary.investigated));
+    output.push(...Agent.renderAgentSummaryField('Learned', summary.learned));
+    output.push(...Agent.renderAgentSummaryField('Completed', summary.completed));
+    output.push(...Agent.renderAgentSummaryField('Next Steps', summary.next_steps));
+    output.push(...Agent.renderAgentSummaryField('Notes', summary.notes ?? null));
   }
 
   return output;

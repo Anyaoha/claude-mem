@@ -1,21 +1,44 @@
-/**
- * Tests for hook timeout and exit code constants
- *
- * Mock Justification (~12% mock code):
- * - process.platform: Only mocked to test cross-platform timeout multiplier
- *   logic - ensures Windows users get appropriate longer timeouts
- *
- * Value: Prevents regressions in timeout values that could cause
- * hook failures on slow systems or Windows
- */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { HOOK_TIMEOUTS, HOOK_EXIT_CODES, getTimeout } from '../src/shared/hook-constants.js';
+import { readFileSync } from 'fs';
+import { join } from 'path';
+import {
+  HOOK_TIMEOUTS,
+  HOOK_EXIT_CODES,
+  defaultSessionInitRequestTimeoutMs,
+  getTimeout,
+  isToolHookDisabledByEnv,
+  isSummarizeDisabledByEnv,
+} from '../src/shared/hook-constants.js';
+
+describe('session-init budget vs the UserPromptSubmit host timeout', () => {
+  it('SESSION_INIT_HOOK_CAP is the timeout hooks.json gives UserPromptSubmit', () => {
+    const hooks = JSON.parse(readFileSync(join(import.meta.dir, '..', 'plugin', 'hooks', 'hooks.json'), 'utf-8'));
+    const timeoutsSeconds = hooks.hooks.UserPromptSubmit.flatMap(
+      (entry: { hooks: Array<{ timeout: number }> }) => entry.hooks.map((hook) => hook.timeout),
+    );
+    expect(timeoutsSeconds.map((seconds: number) => seconds * 1000)).toEqual([HOOK_TIMEOUTS.SESSION_INIT_HOOK_CAP]);
+  });
+
+  it('leaves Windows its 4-5 s of hook start-up plus an exit margin under the cap', () => {
+    // The budget's clock starts inside the handler, after bash, node and the
+    // worker bundle load. On Windows that start-up takes 4-5 s, so the old
+    // 10 s default could end the hook past the 15 s cap.
+    const windowsBudget = defaultSessionInitRequestTimeoutMs('win32');
+    expect(windowsBudget + 5_000 + 2_000).toBeLessThanOrEqual(HOOK_TIMEOUTS.SESSION_INIT_HOOK_CAP);
+    expect(windowsBudget).toBeGreaterThanOrEqual(5_000);
+    expect(defaultSessionInitRequestTimeoutMs('darwin')).toBe(HOOK_TIMEOUTS.SESSION_INIT_REQUEST);
+    expect(defaultSessionInitRequestTimeoutMs('linux')).toBe(HOOK_TIMEOUTS.SESSION_INIT_REQUEST);
+  });
+
+  it('caps user overrides below the host timeout', () => {
+    expect(HOOK_TIMEOUTS.SESSION_INIT_REQUEST_MAX).toBeLessThan(HOOK_TIMEOUTS.SESSION_INIT_HOOK_CAP);
+  });
+});
 
 describe('hook-constants', () => {
   const originalPlatform = process.platform;
 
   afterEach(() => {
-    // Restore original platform after each test
     Object.defineProperty(process, 'platform', {
       value: originalPlatform,
       writable: true,
@@ -24,28 +47,16 @@ describe('hook-constants', () => {
   });
 
   describe('HOOK_TIMEOUTS', () => {
-    it('should define DEFAULT timeout', () => {
-      expect(HOOK_TIMEOUTS.DEFAULT).toBe(300000);
-    });
-
     it('should define HEALTH_CHECK timeout as 3s (reduced from 30s)', () => {
       expect(HOOK_TIMEOUTS.HEALTH_CHECK).toBe(3000);
     });
 
-    it('should define POST_SPAWN_WAIT as 5s', () => {
-      expect(HOOK_TIMEOUTS.POST_SPAWN_WAIT).toBe(5000);
+    it('should define POST_SPAWN_WAIT as 15s', () => {
+      expect(HOOK_TIMEOUTS.POST_SPAWN_WAIT).toBe(15000);
     });
 
     it('should define PORT_IN_USE_WAIT as 3s', () => {
       expect(HOOK_TIMEOUTS.PORT_IN_USE_WAIT).toBe(3000);
-    });
-
-    it('should define WORKER_STARTUP_WAIT', () => {
-      expect(HOOK_TIMEOUTS.WORKER_STARTUP_WAIT).toBe(1000);
-    });
-
-    it('should define PRE_RESTART_SETTLE_DELAY', () => {
-      expect(HOOK_TIMEOUTS.PRE_RESTART_SETTLE_DELAY).toBe(2000);
     });
 
     it('should define WINDOWS_MULTIPLIER', () => {
@@ -60,14 +71,6 @@ describe('hook-constants', () => {
   describe('HOOK_EXIT_CODES', () => {
     it('should define SUCCESS exit code', () => {
       expect(HOOK_EXIT_CODES.SUCCESS).toBe(0);
-    });
-
-    it('should define FAILURE exit code', () => {
-      expect(HOOK_EXIT_CODES.FAILURE).toBe(1);
-    });
-
-    it('should define BLOCKING_ERROR exit code', () => {
-      expect(HOOK_EXIT_CODES.BLOCKING_ERROR).toBe(2);
     });
   });
 
@@ -101,7 +104,6 @@ describe('hook-constants', () => {
         configurable: true
       });
 
-      // 333 * 1.5 = 499.5, should round to 500
       expect(getTimeout(333)).toBe(500);
     });
 
@@ -113,6 +115,75 @@ describe('hook-constants', () => {
       });
 
       expect(getTimeout(1000)).toBe(1000);
+    });
+  });
+
+  describe('isToolHookDisabledByEnv (#3106)', () => {
+    it('is off by default for tool and non-tool events', () => {
+      const env = {};
+      expect(isToolHookDisabledByEnv('observation', env)).toBe(false);
+      expect(isToolHookDisabledByEnv('file-context', env)).toBe(false);
+      expect(isToolHookDisabledByEnv('context', env)).toBe(false);
+      expect(isToolHookDisabledByEnv('session-init', env)).toBe(false);
+      expect(isToolHookDisabledByEnv('summarize', env)).toBe(false);
+    });
+
+    it('CLAUDE_MEM_DISABLE_TOOL_HOOKS=1 disables observation and file-context only', () => {
+      const env = { CLAUDE_MEM_DISABLE_TOOL_HOOKS: '1' };
+      expect(isToolHookDisabledByEnv('observation', env)).toBe(true);
+      expect(isToolHookDisabledByEnv('file-context', env)).toBe(true);
+      expect(isToolHookDisabledByEnv('context', env)).toBe(false);
+      expect(isToolHookDisabledByEnv('session-init', env)).toBe(false);
+      expect(isToolHookDisabledByEnv('summarize', env)).toBe(false);
+      expect(isToolHookDisabledByEnv('user-message', env)).toBe(false);
+    });
+
+    it('ignores non-1 values for the coarse flag', () => {
+      expect(isToolHookDisabledByEnv('observation', { CLAUDE_MEM_DISABLE_TOOL_HOOKS: 'true' })).toBe(false);
+      expect(isToolHookDisabledByEnv('observation', { CLAUDE_MEM_DISABLE_TOOL_HOOKS: '0' })).toBe(false);
+    });
+
+    it('supports granular observation / file-context flags', () => {
+      expect(isToolHookDisabledByEnv('observation', { CLAUDE_MEM_DISABLE_OBSERVATION: '1' })).toBe(true);
+      expect(isToolHookDisabledByEnv('file-context', { CLAUDE_MEM_DISABLE_OBSERVATION: '1' })).toBe(false);
+      expect(isToolHookDisabledByEnv('file-context', { CLAUDE_MEM_DISABLE_FILE_CONTEXT: '1' })).toBe(true);
+      expect(isToolHookDisabledByEnv('observation', { CLAUDE_MEM_DISABLE_FILE_CONTEXT: '1' })).toBe(false);
+    });
+  });
+
+  describe('isSummarizeDisabledByEnv (#4734)', () => {
+    it('is off by default for every event', () => {
+      const env = {};
+      expect(isSummarizeDisabledByEnv('summarize', env)).toBe(false);
+      expect(isSummarizeDisabledByEnv('context', env)).toBe(false);
+      expect(isSummarizeDisabledByEnv('session-init', env)).toBe(false);
+      expect(isSummarizeDisabledByEnv('observation', env)).toBe(false);
+      expect(isSummarizeDisabledByEnv('file-context', env)).toBe(false);
+      expect(isSummarizeDisabledByEnv('session-end', env)).toBe(false);
+    });
+
+    it('CLAUDE_MEM_DISABLE_SUMMARY=1 disables summarize only', () => {
+      const env = { CLAUDE_MEM_DISABLE_SUMMARY: '1' };
+      expect(isSummarizeDisabledByEnv('summarize', env)).toBe(true);
+      // The reads stay on: SessionStart context and UserPromptSubmit session-init
+      // are the point of keeping claude-mem enabled for headless runs.
+      expect(isSummarizeDisabledByEnv('context', env)).toBe(false);
+      expect(isSummarizeDisabledByEnv('session-init', env)).toBe(false);
+      expect(isSummarizeDisabledByEnv('observation', env)).toBe(false);
+      expect(isSummarizeDisabledByEnv('file-context', env)).toBe(false);
+      expect(isSummarizeDisabledByEnv('session-end', env)).toBe(false);
+    });
+
+    it('keeps the switches separate: the tool-hook flags never stop the summary', () => {
+      expect(isSummarizeDisabledByEnv('summarize', { CLAUDE_MEM_DISABLE_TOOL_HOOKS: '1' })).toBe(false);
+      expect(isSummarizeDisabledByEnv('summarize', { CLAUDE_MEM_DISABLE_OBSERVATION: '1' })).toBe(false);
+      expect(isSummarizeDisabledByEnv('summarize', { CLAUDE_MEM_DISABLE_FILE_CONTEXT: '1' })).toBe(false);
+    });
+
+    it('ignores non-1 values', () => {
+      expect(isSummarizeDisabledByEnv('summarize', { CLAUDE_MEM_DISABLE_SUMMARY: 'true' })).toBe(false);
+      expect(isSummarizeDisabledByEnv('summarize', { CLAUDE_MEM_DISABLE_SUMMARY: '0' })).toBe(false);
+      expect(isSummarizeDisabledByEnv('summarize', { CLAUDE_MEM_DISABLE_SUMMARY: '' })).toBe(false);
     });
   });
 });

@@ -3,21 +3,9 @@ import { readdir } from "fs/promises";
 import { join, relative } from "path";
 import { readFileSync } from "fs";
 
-/**
- * Logger Usage Standards - Enforces coding standards for logging
- *
- * This test enforces logging standards by:
- * 1. Detecting console.log/console.error usage in background services (invisible logs)
- * 2. Ensuring high-priority service files import the logger
- * 3. Reporting coverage statistics for observability
- *
- * Note: This is a legitimate coding standard enforcement test, not a coverage metric.
- */
-
 const PROJECT_ROOT = join(import.meta.dir, "..");
 const SRC_DIR = join(PROJECT_ROOT, "src");
 
-// Files/directories that don't require logging
 const EXCLUDED_PATTERNS = [
   /types\//,             // Type definition files
   /constants\//,         // Pure constants
@@ -25,6 +13,7 @@ const EXCLUDED_PATTERNS = [
   /^ui\//,               // UI components (separate logging context)
   /^bin\//,              // CLI utilities (may use console.log for output)
   /index\.ts$/,          // Re-export files
+  /integrations\/opencode-plugin\//,  // OpenCode plugin bundle: must stay free of worker-only imports (logger pulls in settings-document/hook-io), so it logs to the host's console; only the entry index.ts was excluded before the v1/v2 split
   /logger\.ts$/,         // Logger itself
   /hook-response\.ts$/,  // Pure data structure
   /hook-constants\.ts$/, // Pure constants
@@ -36,12 +25,40 @@ const EXCLUDED_PATTERNS = [
   /SettingsDefaultsManager\.ts$/,  // Must use console.log to avoid circular dependency with logger
   /user-message-hook\.ts$/,  // Deprecated - kept for reference only, not registered in hooks.json
   /cli\/hook-command\.ts$/,  // CLI hook command uses console.log/error for hook protocol output
+  /shared\/hook-io\.ts$/,  // Canonical hook-protocol IO module: console.log emits MODEL_CONTEXT JSON to stdout (plan 01 / #2292)
   /cli\/handlers\/user-message\.ts$/,  // User message handler uses console.error for user-visible context
   /services\/transcripts\/cli\.ts$/,  // CLI transcript subcommands use console.log for user-visible interactive output
+  /services\/memory\/cli\.ts$/,  // CLI `memory ingest` prints its dry-run and import report to the user's terminal
+  /services\/transcripts\/transcript-watcher-entry\.ts$/,  // CLI process entry point: console.error on fatal startup error goes to a visible stderr (own process, not a background service)
+  /npx-cli\/commands\//,  // npx CLI subcommands (install/uninstall/runtime/server/etc) emit user-visible terminal output
+  /npx-cli\/install\//,  // npx CLI install-time modules (error-reporter/setup-runtime/etc) emit user-visible terminal output during `npx claude-mem install`
+  /npx-cli\/banner\.ts$/,  // npx CLI banner animation runs only on an interactive TTY; console.warn on frame-decode failure is user-visible terminal output
+  /server\/runtime\/ServerService\.ts$/,  // server CLI entry point (status/usage output, process.exit)
+  /integrations\/McpIntegrations\.ts$/,  // CLI installer for MCP integrations (interactive install output)
+  /errors\.ts$/,  // Error class/type definitions (pure data, no logic to instrument)
+  /worker\/provider-errors\.ts$/,  // Provider error classification (pure data structures)
+  /worker\/agents\/FallbackErrorHandler\.ts$/,  // Pure isAbortError predicate after dead-code removal; no side effects (mirrors output-classifier)
+  /worker\/search\/ResultFormatter\.ts$/,  // Pure static Chroma-failure message builder; no side effects (mirrors CorpusRenderer)
+  /worker\/search\/project-where-filter\.ts$/,  // Pure Chroma project where-clause builder; logging happens at the search call sites
+  /worker\/knowledge\/CorpusRenderer\.ts$/,  // Pure string/markdown rendering, no side effects
+  /worker\/http\/middleware\/validateBody\.ts$/,  // Trivial zod validation middleware factory
+  /worker\/RateLimitStore\.ts$/,  // Side-effect-free in-memory rate-limit store
+  /worker\/events\/SessionEventBroadcaster\.ts$/,  // Thin SSE broadcast wrapper, no error paths
+  /sdk\/output-classifier\.ts$/,  // Pure, side-effect-free output classifier; logging happens at the ResponseProcessor call site with full session context
+  /build\/hook-shell-template\.ts$/,  // Pure build-time shell-string generator (no runtime/observability surface); drift is enforced by build-hooks.js + plugin-distribution.test.ts
+  /worker\/model-aliases\.ts$/,  // Pure $TIER alias resolver (#2289); side-effect-free passthrough, logging happens at the request-time call site
+  /worker\/observer-usage\.ts$/,  // Pure observer token accumulation helpers; logging happens at provider/session completion call sites (#3508)
+  /worker\/session\/OutputRecovery\.ts$/,  // Pure per-batch rejection counter; the retry and drop are logged at the ResponseProcessor call site (#3624)
+  /worker\/session\/abort-reason\.ts$/,  // Pure abort-category authority (enum + preserve set); exits are logged by the handler and runner (#3475)
+  /worker\/TimelineService\.ts$/,  // Pure filterByDepth helper after dead-code removal; no side effects (mirrors FallbackErrorHandler)
+  /sqlite\/project-read-keys\.ts$/,  // Pure project-scope SQL builders plus one read query; logging happens at the search/context call sites
+  /servers\/checkout-search-scope\.ts$/,  // Pure MCP search-args transform; no side effects or error paths
+  /sync\/prompt-text-clamp\.ts$/,  // Pure prompt_text bound (SQL column fragment + clamp); CloudSync logs and quarantines at the drain (#3537)
+  /worker\/paid-send-budget\.ts$/,  // Pure per-batch paid-send counter; spends and exhaustion are logged at the provider call sites
+  /servers\/corpus-worker-stream\.ts$/,  // MCP SSE transport; every failure throws to callWorker in mcp-server.ts, which logs it
+  /servers\/worker-restart\.ts$/,  // MCP refused-connection retry; the restart is logged by ensureWorkerConnection and failures by callWorker in mcp-server.ts
 ];
 
-// Files that should always use logger (core business logic)
-// Excludes UI files, type files, and pure utilities
 const HIGH_PRIORITY_PATTERNS = [
   /^services\/worker\/(?!.*types\.ts$)/,  // Worker services (not type files)
   /^services\/sqlite\/(?!types\.ts$|index\.ts$)/,  // SQLite services
@@ -52,7 +69,6 @@ const HIGH_PRIORITY_PATTERNS = [
   /^servers\/(?!.*types?\.ts$)/,  // Server files (not type files)
 ];
 
-// Additional check: exclude UI files from high priority
 const isUIFile = (path: string) => /^ui\//.test(path);
 
 interface FileAnalysis {
@@ -61,13 +77,9 @@ interface FileAnalysis {
   hasLoggerImport: boolean;
   usesConsoleLog: boolean;
   consoleLogLines: number[];
-  loggerCallCount: number;
   isHighPriority: boolean;
 }
 
-/**
- * Recursively find all TypeScript files in a directory
- */
 async function findTypeScriptFiles(dir: string): Promise<string[]> {
   const files: string[] = [];
   const entries = await readdir(dir, { withFileTypes: true });
@@ -85,21 +97,14 @@ async function findTypeScriptFiles(dir: string): Promise<string[]> {
   return files;
 }
 
-/**
- * Check if a file should be excluded from logger requirements
- */
 function shouldExclude(filePath: string): boolean {
-  const relativePath = relative(SRC_DIR, filePath);
+  const relativePath = relative(SRC_DIR, filePath).replaceAll("\\", "/");
   return EXCLUDED_PATTERNS.some(pattern => pattern.test(relativePath));
 }
 
-/**
- * Check if a file is high priority for logging
- */
 function isHighPriority(filePath: string): boolean {
-  const relativePath = relative(SRC_DIR, filePath);
+  const relativePath = relative(SRC_DIR, filePath).replaceAll("\\", "/");
 
-  // UI files are never high priority
   if (isUIFile(relativePath)) {
     return false;
   }
@@ -107,18 +112,13 @@ function isHighPriority(filePath: string): boolean {
   return HIGH_PRIORITY_PATTERNS.some(pattern => pattern.test(relativePath));
 }
 
-/**
- * Analyze a single TypeScript file for logger usage
- */
 function analyzeFile(filePath: string): FileAnalysis {
   const content = readFileSync(filePath, "utf-8");
   const lines = content.split("\n");
-  const relativePath = relative(PROJECT_ROOT, filePath);
+  const relativePath = relative(PROJECT_ROOT, filePath).replaceAll("\\", "/");
 
-  // Check for logger import (handles both .ts and .js extensions in import paths)
   const hasLoggerImport = /import\s+.*logger.*from\s+['"].*logger(\.(js|ts))?['"]/.test(content);
 
-  // Find console.log/console.error usage with line numbers
   const consoleLogLines: number[] = [];
   lines.forEach((line, index) => {
     if (/console\.(log|error|warn|info|debug)/.test(line)) {
@@ -126,17 +126,12 @@ function analyzeFile(filePath: string): FileAnalysis {
     }
   });
 
-  // Count logger method calls
-  const loggerCallMatches = content.match(/logger\.(debug|info|warn|error|success|failure|timing|dataIn|dataOut|happyPathError)\(/g);
-  const loggerCallCount = loggerCallMatches ? loggerCallMatches.length : 0;
-
   return {
     path: filePath,
     relativePath,
     hasLoggerImport,
     usesConsoleLog: consoleLogLines.length > 0,
     consoleLogLines,
-    loggerCallCount,
     isHighPriority: isHighPriority(filePath),
   };
 }
@@ -155,8 +150,6 @@ describe("Logger Usage Standards", () => {
   });
 
   it("should NOT use console.log/console.error (these logs are invisible in background services)", () => {
-    // Only hook files can use console.log for their final output response
-    // Everything else (services, workers, sqlite, etc.) runs in background - console.log is USELESS there
     const filesWithConsole = relevantFiles.filter(f => {
       const isHookFile = /^src\/hooks\//.test(f.relativePath);
       return f.usesConsoleLog && !isHookFile;
@@ -190,31 +183,5 @@ describe("Logger Usage Standards", () => {
         `These files should import and use logger for debugging and observability.`
       );
     }
-  });
-
-  it("should report logger coverage statistics", () => {
-    const withLogger = relevantFiles.filter(f => f.hasLoggerImport);
-    const withoutLogger = relevantFiles.filter(f => !f.hasLoggerImport);
-    const totalCalls = relevantFiles.reduce((sum, f) => sum + f.loggerCallCount, 0);
-
-    const coverage = ((withLogger.length / relevantFiles.length) * 100).toFixed(1);
-
-    console.log("\n📊 Logger Coverage Report:");
-    console.log(`  Total files analyzed: ${relevantFiles.length}`);
-    console.log(`  Files with logger: ${withLogger.length} (${coverage}%)`);
-    console.log(`  Files without logger: ${withoutLogger.length}`);
-    console.log(`  Total logger calls: ${totalCalls}`);
-    console.log(`  Excluded files: ${allFiles.length - relevantFiles.length}`);
-
-    if (withoutLogger.length > 0) {
-      console.log("\n📝 Files without logger:");
-      withoutLogger.forEach(f => {
-        const priority = f.isHighPriority ? "🔴 HIGH" : "  ";
-        console.log(`  ${priority} ${f.relativePath}`);
-      });
-    }
-
-    // This is an informational test - we expect some files won't need logging
-    expect(withLogger.length).toBeGreaterThan(0);
   });
 });
